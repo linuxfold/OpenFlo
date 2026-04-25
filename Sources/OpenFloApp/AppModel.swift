@@ -114,7 +114,9 @@ final class AppModel: ObservableObject {
     }
 
     var visibleEventCount: Int {
-        baseMask?.selectedCount ?? table.rowCount
+        guard let baseMask else { return table.rowCount }
+        guard baseMask.count == table.rowCount else { return 0 }
+        return baseMask.selectedCount
     }
 
     var currentXChannelName: String {
@@ -207,7 +209,16 @@ final class AppModel: ObservableObject {
         let xTransform = self.xTransform
         let yTransform = self.yTransform
         let plotMode = self.plotMode
-        let baseMask = self.baseMask
+        let baseMask: EventMask?
+        let repairedPopulationMask: Bool
+        if let currentBaseMask = self.baseMask, currentBaseMask.count != table.rowCount {
+            baseMask = EventMask(count: table.rowCount)
+            self.baseMask = baseMask
+            repairedPopulationMask = true
+        } else {
+            baseMask = self.baseMask
+            repairedPopulationMask = false
+        }
 
         renderQueue.async {
             let xValues = xTransform.apply(to: table.column(xChannel))
@@ -240,7 +251,11 @@ final class AppModel: ObservableObject {
                 self.xRange = resolvedXRange
                 self.yRange = resolvedYRange
                 self.plotImage = image
-                self.status = "\(reason). \(self.visibleEventCount.formatted()) visible events, \(table.channelCount) channels."
+                if repairedPopulationMask {
+                    self.status = "\(reason). Population mask no longer matched this sample; showing 0 visible events."
+                } else {
+                    self.status = "\(reason). \(self.visibleEventCount.formatted()) visible events, \(table.channelCount) channels."
+                }
             }
         }
     }

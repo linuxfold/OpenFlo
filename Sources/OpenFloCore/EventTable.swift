@@ -67,23 +67,26 @@ public final class EventTable: @unchecked Sendable {
         guard !values.isEmpty else { return 0...1 }
         var minimum = Float.greatestFiniteMagnitude
         var maximum = -Float.greatestFiniteMagnitude
+        var foundValue = false
 
         if let mask {
-            precondition(mask.count == values.count, "Mask count must match values count")
+            guard mask.count == values.count else { return 0...1 }
             for index in values.indices where mask[index] {
                 let value = values[index]
                 guard value.isFinite else { continue }
+                foundValue = true
                 minimum = Swift.min(minimum, value)
                 maximum = Swift.max(maximum, value)
             }
         } else {
             for value in values where value.isFinite {
+                foundValue = true
                 minimum = Swift.min(minimum, value)
                 maximum = Swift.max(maximum, value)
             }
         }
 
-        guard minimum.isFinite, maximum.isFinite else { return 0...1 }
+        guard foundValue, minimum.isFinite, maximum.isFinite else { return 0...1 }
         if minimum == maximum {
             let pad = max(abs(minimum) * 0.05, 1)
             return (minimum - pad)...(maximum + pad)
@@ -102,7 +105,7 @@ public final class EventTable: @unchecked Sendable {
         precondition(lowerQuantile >= 0 && lowerQuantile < upperQuantile, "Lower quantile must be below upper quantile")
         precondition(upperQuantile <= 1, "Upper quantile cannot exceed one")
         if let mask {
-            precondition(mask.count == values.count, "Mask count must match values count")
+            guard mask.count == values.count else { return 0...1 }
         }
 
         let selectedCount = mask?.selectedCount ?? values.count
