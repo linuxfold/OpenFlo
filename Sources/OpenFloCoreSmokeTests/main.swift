@@ -58,6 +58,18 @@ func testFocusedRangeIgnoresExtremeOutliers() {
     expect(full.upperBound > 900_000, "full range should include the extreme event")
 }
 
+func testRangesTolerateInvalidMasks() {
+    let values: [Float] = [10, 20, 30]
+    let shortMask = EventMask(count: 2, fill: true)
+    let emptySelection = EventMask(count: values.count)
+    let nonFiniteValues: [Float] = [.nan, .infinity, -.infinity]
+
+    expect(EventTable.range(values: values, mask: shortMask) == 0...1, "range should fall back for mismatched masks")
+    expect(EventTable.range(values: values, mask: emptySelection) == 0...1, "range should fall back when no events are selected")
+    expect(EventTable.range(values: nonFiniteValues) == 0...1, "range should fall back when no finite values are available")
+    expect(EventTable.focusedRange(values: values, mask: shortMask) == 0...1, "focused range should fall back for mismatched masks")
+}
+
 func testFCSTextParserHandlesEscapedDelimiter() throws {
     let text = "/$PAR/2/$P1N/FSC-A/$P2N/CD//3/$TOT/1/"
     let keywords = try FCSParser.parseTextSegment(Data(text.utf8))
@@ -113,6 +125,7 @@ testMaskBooleanOperations()
 testRectangleGate()
 testHistogramBuildsExpectedBins()
 testFocusedRangeIgnoresExtremeOutliers()
+testRangesTolerateInvalidMasks()
 try testFCSTextParserHandlesEscapedDelimiter()
 try testFCSFloatByteOrders()
 print("OpenFloCore smoke tests passed")
