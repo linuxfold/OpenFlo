@@ -5,11 +5,30 @@ public struct Channel: Equatable, Sendable, Identifiable {
     public let name: String
     public let displayName: String
     public let bitWidth: Int?
+    public let markerName: String?
+    public let fluorochromeName: String?
 
-    public init(name: String, displayName: String? = nil, bitWidth: Int? = nil) {
+    public init(
+        name: String,
+        displayName: String? = nil,
+        bitWidth: Int? = nil,
+        markerName: String? = nil,
+        fluorochromeName: String? = nil
+    ) {
         self.name = name
-        self.displayName = displayName ?? name
         self.bitWidth = bitWidth
+        self.markerName = markerName
+        self.fluorochromeName = fluorochromeName
+
+        if let displayName {
+            self.displayName = displayName
+        } else if let markerName, let fluorochromeName {
+            self.displayName = "\(markerName) (\(fluorochromeName))"
+        } else if let markerName {
+            self.displayName = markerName
+        } else {
+            self.displayName = name
+        }
     }
 }
 

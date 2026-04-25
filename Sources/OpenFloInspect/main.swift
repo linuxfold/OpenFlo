@@ -22,7 +22,14 @@ for index in table.channels.indices {
     let channel = table.channels[index]
     let full = table.range(for: index)
     let focus = table.focusedRange(for: index)
-    let label = channel.displayName == channel.name ? channel.name : "\(channel.name) (\(channel.displayName))"
+    let label: String
+    if let marker = channel.markerName, let fluorochrome = channel.fluorochromeName {
+        label = "\(marker) (\(fluorochrome)) - \(channel.name)"
+    } else if channel.displayName == channel.name {
+        label = channel.name
+    } else {
+        label = "\(channel.name) (\(channel.displayName))"
+    }
     print("\(index + 1). \(label): full \(format(full)), focus75 \(format(focus))")
 }
 

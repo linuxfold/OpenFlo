@@ -85,8 +85,26 @@ func testFCSFloatByteOrders() throws {
     expect(abs(big.table.value(event: 0, channel: 0) - 42.25) < 0.001, "4,3,2,1 should parse as big-endian")
 }
 
-func singleFloatFCS(value: Float, byteOrder: String) -> Data {
-    let text = "/$TOT/1/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/FSC-A/$P1B/32/$P1R/262144/"
+func testFCSMarkerFluorochromeLabels() throws {
+    let file = try FCSParser.parse(
+        data: singleFloatFCS(
+            value: 42.25,
+            byteOrder: "1,2,3,4",
+            parameterName: "Alexa Fluor 647-A",
+            parameterStain: "CD86"
+        )
+    )
+    let channel = file.table.channels[0]
+
+    expect(channel.name == "Alexa Fluor 647-A", "channel name should preserve the detector label")
+    expect(channel.markerName == "CD86", "channel marker should come from $P1S")
+    expect(channel.fluorochromeName == "AF647", "Alexa Fluor 647 should be abbreviated to AF647")
+    expect(channel.displayName == "CD86 (AF647)", "display name should combine marker and fluorochrome")
+}
+
+func singleFloatFCS(value: Float, byteOrder: String, parameterName: String = "FSC-A", parameterStain: String? = nil) -> Data {
+    let stainText = parameterStain.map { "/$P1S/\($0)" } ?? ""
+    let text = "/$TOT/1/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/\(parameterName)/$P1B/32/$P1R/262144\(stainText)/"
     let textStart = 58
     let textEnd = textStart + text.utf8.count - 1
     let dataStart = textEnd + 1
@@ -128,4 +146,5 @@ testFocusedRangeIgnoresExtremeOutliers()
 testRangesTolerateInvalidMasks()
 try testFCSTextParserHandlesEscapedDelimiter()
 try testFCSFloatByteOrders()
+try testFCSMarkerFluorochromeLabels()
 print("OpenFloCore smoke tests passed")

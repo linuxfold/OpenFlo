@@ -228,8 +228,8 @@ final class AppModel: ObservableObject {
             let image: NSImage
             if plotMode == .histogram {
                 let histogram = Histogram1D.build(values: xValues, mask: baseMask, width: 640, xRange: resolvedXRange)
-                resolvedYRange = 0...Float(max(histogram.maxBin, 1))
-                image = HistogramRenderer.image(from: histogram)
+                resolvedYRange = Self.histogramYRange(maxBin: histogram.maxBin)
+                image = HistogramRenderer.image(from: histogram, yRange: resolvedYRange)
             } else {
                 resolvedYRange = EventTable.range(values: yValues, mask: baseMask)
                 let histogram = Histogram2D.build(
@@ -414,6 +414,26 @@ final class AppModel: ObservableObject {
         table.channels.firstIndex { channel in
             channel.name == name || channel.displayName == name
         }
+    }
+
+    private nonisolated static func histogramYRange(maxBin: UInt32) -> ClosedRange<Float> {
+        let maximum = max(Float(maxBin), 1)
+        let exponent = floor(log10(maximum))
+        let magnitude = pow(Float(10), exponent)
+        let fraction = maximum / magnitude
+        let niceFraction: Float
+        if fraction <= 1 {
+            niceFraction = 1
+        } else if fraction <= 2 {
+            niceFraction = 2
+        } else if fraction <= 2.5 {
+            niceFraction = 2.5
+        } else if fraction <= 5 {
+            niceFraction = 5
+        } else {
+            niceFraction = 10
+        }
+        return 0...(niceFraction * magnitude)
     }
 
     private func defaultLabelPosition(for gate: PolygonGate) -> PlotPoint {

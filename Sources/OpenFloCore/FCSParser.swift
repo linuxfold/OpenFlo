@@ -79,9 +79,10 @@ public enum FCSParser {
 
         let channels = (1...parameterCount).map { index in
             let name = keywords["$P\(index)N"] ?? "P\(index)"
-            let display = keywords["$P\(index)S"]
+            let marker = normalizedOptional(keywords["$P\(index)S"])
+            let fluorochrome = fluorochromeName(from: name, markerName: marker)
             let bitWidth = Int(keywords["$P\(index)B"] ?? "")
-            return Channel(name: name, displayName: display, bitWidth: bitWidth)
+            return Channel(name: name, bitWidth: bitWidth, markerName: marker, fluorochromeName: fluorochrome)
         }
 
         let segment = data[dataStart...dataEnd]
@@ -229,6 +230,49 @@ public enum FCSParser {
             throw FCSParserError.missingKeyword(key)
         }
         return value
+    }
+
+    private static func normalizedOptional(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func fluorochromeName(from channelName: String, markerName: String?) -> String? {
+        guard markerName != nil else { return nil }
+        let detector = detectorName(from: channelName)
+        let upper = detector.uppercased()
+        guard !upper.isEmpty, !upper.hasPrefix("FSC"), !upper.hasPrefix("SSC"), upper != "TIME" else {
+            return nil
+        }
+        return canonicalFluorochromeName(detector)
+    }
+
+    private static func detectorName(from channelName: String) -> String {
+        let trimmed = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = trimmed.uppercased()
+        for suffix in ["-A", "-H", "-W"] where upper.hasSuffix(suffix) {
+            return String(trimmed.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+
+    private static func canonicalFluorochromeName(_ name: String) -> String {
+        let collapsed = name.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let upper = collapsed.uppercased()
+        if upper.hasPrefix("ALEXA FLUOR ") {
+            let number = collapsed.dropFirst("Alexa Fluor ".count).filter { $0.isNumber }
+            if !number.isEmpty {
+                return "AF\(number)"
+            }
+        }
+        if upper.hasPrefix("ALEXAFLUOR ") {
+            let number = collapsed.dropFirst("AlexaFluor ".count).filter { $0.isNumber }
+            if !number.isEmpty {
+                return "AF\(number)"
+            }
+        }
+        return collapsed
     }
 
     private static func headerInteger(_ data: Data, _ range: Range<Int>) throws -> Int {

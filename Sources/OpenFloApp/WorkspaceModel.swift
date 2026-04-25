@@ -229,20 +229,38 @@ final class WorkspaceModel: ObservableObject {
 
     func copyGate(dragPayload: String, to target: WorkspaceSelection) {
         guard dragPayload.hasPrefix("gate:"), let sourceGateID = UUID(uuidString: String(dragPayload.dropFirst(5))) else { return }
-        guard let sourceGate = samples.compactMap({ gate(id: sourceGateID, in: $0.gates) }).first else { return }
+        guard let source = sampleAndGatePath(containing: sourceGateID), let sourceGate = source.path.last else { return }
         guard let targetSample = sample(id: target.sampleID) else { return }
 
-        let clone = sourceGate.clone()
-        clone.name = uniqueGateName(clone.name, under: target)
         objectWillChange.send()
+        let insertedRoot: WorkspaceGateNode
+        let insertedSelection: WorkspaceGateNode
         if let targetGateID = target.gateID, let targetGate = gate(id: targetGateID, in: targetSample.gates) {
+            let clone = sourceGate.clone()
+            clone.name = uniqueGateName(clone.name, under: target)
             targetGate.children.append(clone)
+            insertedRoot = clone
+            insertedSelection = clone
+        } else if source.path.count > 1 {
+            let clonedPath = cloneGatePath(source.path)
+            clonedPath.root.name = uniqueGateName(clonedPath.root.name, in: targetSample.gates)
+            targetSample.gates.append(clonedPath.root)
+            insertedRoot = clonedPath.root
+            insertedSelection = clonedPath.leaf
         } else {
+            let clone = sourceGate.clone()
+            clone.name = uniqueGateName(clone.name, under: target)
             targetSample.gates.append(clone)
+            insertedRoot = clone
+            insertedSelection = clone
         }
-        refreshCount(for: clone, in: targetSample)
-        selected = WorkspaceSelection(sampleID: targetSample.id, gateID: clone.id)
-        status = "Copied \(sourceGate.name) to \(targetSample.name)."
+        refreshCounts(for: insertedRoot, in: targetSample)
+        selected = WorkspaceSelection(sampleID: targetSample.id, gateID: insertedSelection.id)
+        if source.path.count > 1, target.gateID == nil {
+            status = "Copied \(sourceGate.name) with parent gates to \(targetSample.name)."
+        } else {
+            status = "Copied \(sourceGate.name) to \(targetSample.name)."
+        }
     }
 
     func dragPayload(for row: WorkspaceRow) -> String? {
@@ -396,6 +414,33 @@ final class WorkspaceModel: ObservableObject {
         return nil
     }
 
+    private func sampleAndGatePath(containing id: UUID) -> (sample: WorkspaceSample, path: [WorkspaceGateNode])? {
+        for sample in samples {
+            if let path = gatePath(id, in: sample.gates) {
+                return (sample, path)
+            }
+        }
+        return nil
+    }
+
+    private func cloneGatePath(_ path: [WorkspaceGateNode]) -> (root: WorkspaceGateNode, leaf: WorkspaceGateNode) {
+        let leaf = path.last!.clone()
+        var root = leaf
+        for node in path.dropLast().reversed() {
+            root = WorkspaceGateNode(
+                name: node.name,
+                gate: node.gate,
+                xChannelName: node.xChannelName,
+                yChannelName: node.yChannelName,
+                xTransform: node.xTransform,
+                yTransform: node.yTransform,
+                count: nil,
+                children: [root]
+            )
+        }
+        return (root, leaf)
+    }
+
     private func parentGateID(of id: UUID, in gates: [WorkspaceGateNode], parent: UUID?) -> UUID? {
         for gate in gates {
             if gate.id == id {
@@ -457,6 +502,13 @@ final class WorkspaceModel: ObservableObject {
         if let path = gatePath(node.id, in: sample.gates) {
             objectWillChange.send()
             node.count = evaluate(path: path, sample: sample).selectedCount
+        }
+    }
+
+    private func refreshCounts(for node: WorkspaceGateNode, in sample: WorkspaceSample) {
+        refreshCount(for: node, in: sample)
+        for child in node.children {
+            refreshCounts(for: child, in: sample)
         }
     }
 

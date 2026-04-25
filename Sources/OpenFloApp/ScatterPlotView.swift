@@ -9,6 +9,8 @@ struct ScatterPlotView: View {
     let gate: PolygonGate?
     let gateTool: GateTool
     let plotMode: PlotMode
+    let xTransform: TransformKind
+    let yTransform: TransformKind
     let gateLabelPosition: PlotPoint?
     let gatePercentText: String
     let channels: [Channel]
@@ -34,6 +36,11 @@ struct ScatterPlotView: View {
         case label
     }
 
+    private struct AxisTick {
+        let value: Float
+        let label: String
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let plotRect = squarePlotRect(in: geometry.size)
@@ -53,7 +60,7 @@ struct ScatterPlotView: View {
                     drawGate(context: context, plotRect: plotRect)
                     drawDrag(context: context, plotRect: plotRect)
                     drawPolygonDraft(context: context, plotRect: plotRect)
-                    drawFrame(context: context, plotRect: plotRect)
+                    drawAxes(context: context, plotRect: plotRect)
                 }
 
                 if let gateLabelPosition, !gatePercentText.isEmpty {
@@ -88,7 +95,7 @@ struct ScatterPlotView: View {
                     onSelect: onXChannelChange,
                     onHistogram: {}
                 )
-                .position(x: plotRect.midX, y: min(geometry.size.height - 14, plotRect.maxY + 26))
+                .position(x: plotRect.midX, y: min(geometry.size.height - 16, plotRect.maxY + 50))
 
                 axisMenu(
                     label: plotMode == .histogram ? "Histogram" : channels[yChannel].displayName,
@@ -100,7 +107,7 @@ struct ScatterPlotView: View {
                     }
                 )
                 .rotationEffect(.degrees(-90))
-                .position(x: max(16, plotRect.minX - 42), y: plotRect.midY)
+                .position(x: max(18, plotRect.minX - 70), y: plotRect.midY)
             }
             .clipShape(Rectangle())
             .contentShape(Rectangle())
@@ -124,10 +131,16 @@ struct ScatterPlotView: View {
     }
 
     private func squarePlotRect(in size: CGSize) -> CGRect {
-        let side = max(1, min(size.width - 72, size.height - 58))
+        let leftMargin: CGFloat = 108
+        let rightMargin: CGFloat = 34
+        let topMargin: CGFloat = 22
+        let bottomMargin: CGFloat = 76
+        let availableWidth = max(1, size.width - leftMargin - rightMargin)
+        let availableHeight = max(1, size.height - topMargin - bottomMargin)
+        let side = max(1, min(availableWidth, availableHeight))
         return CGRect(
-            x: (size.width - side) / 2 + 18,
-            y: (size.height - side) / 2 - 10,
+            x: leftMargin + (availableWidth - side) / 2,
+            y: topMargin + (availableHeight - side) / 2,
             width: side,
             height: side
         )
@@ -377,8 +390,154 @@ struct ScatterPlotView: View {
         context.stroke(path, with: .color(.black), lineWidth: 1.5)
     }
 
-    private func drawFrame(context: GraphicsContext, plotRect: CGRect) {
-        context.stroke(Path(plotRect), with: .color(.black.opacity(0.55)), lineWidth: 1)
+    private func drawAxes(context: GraphicsContext, plotRect: CGRect) {
+        context.stroke(Path(plotRect), with: .color(.black.opacity(0.82)), lineWidth: 1.2)
+
+        for tick in ticks(for: xRange, transform: xTransform, targetCount: 7) {
+            guard let x = xPosition(for: tick.value, in: plotRect) else { continue }
+            var tickPath = Path()
+            tickPath.move(to: CGPoint(x: x, y: plotRect.maxY))
+            tickPath.addLine(to: CGPoint(x: x, y: plotRect.maxY + 7))
+            context.stroke(tickPath, with: .color(.black), lineWidth: 1.2)
+
+            let text = context.resolve(
+                Text(tick.label)
+                    .font(.caption2)
+                    .foregroundStyle(.black)
+            )
+            context.draw(text, at: CGPoint(x: x, y: plotRect.maxY + 11), anchor: .top)
+        }
+
+        let yAxisTicks = plotMode == .histogram
+            ? linearTicks(in: yRange, targetCount: 6)
+            : ticks(for: yRange, transform: yTransform, targetCount: 6)
+        for tick in yAxisTicks {
+            guard let y = yPosition(for: tick.value, in: plotRect) else { continue }
+            var tickPath = Path()
+            tickPath.move(to: CGPoint(x: plotRect.minX - 7, y: y))
+            tickPath.addLine(to: CGPoint(x: plotRect.minX, y: y))
+            context.stroke(tickPath, with: .color(.black), lineWidth: 1.2)
+
+            let text = context.resolve(
+                Text(tick.label)
+                    .font(.caption2)
+                    .foregroundStyle(.black)
+            )
+            context.draw(text, at: CGPoint(x: plotRect.minX - 10, y: y), anchor: .trailing)
+        }
+    }
+
+    private func xPosition(for value: Float, in plotRect: CGRect) -> CGFloat? {
+        let span = xRange.upperBound - xRange.lowerBound
+        guard span.isFinite, span > 0 else { return nil }
+        let fraction = CGFloat((value - xRange.lowerBound) / span)
+        guard fraction.isFinite, fraction >= -0.001, fraction <= 1.001 else { return nil }
+        return plotRect.minX + min(max(fraction, 0), 1) * plotRect.width
+    }
+
+    private func yPosition(for value: Float, in plotRect: CGRect) -> CGFloat? {
+        let span = yRange.upperBound - yRange.lowerBound
+        guard span.isFinite, span > 0 else { return nil }
+        let fraction = CGFloat((value - yRange.lowerBound) / span)
+        guard fraction.isFinite, fraction >= -0.001, fraction <= 1.001 else { return nil }
+        return plotRect.maxY - min(max(fraction, 0), 1) * plotRect.height
+    }
+
+    private func ticks(for range: ClosedRange<Float>, transform: TransformKind, targetCount: Int) -> [AxisTick] {
+        switch transform {
+        case .pseudoLog:
+            let pseudoLogTicks = pseudoLogAxisTicks(in: range, targetCount: targetCount)
+            return pseudoLogTicks.count >= 2 ? pseudoLogTicks : linearTicks(in: range, targetCount: targetCount)
+        case .linear, .arcsinh:
+            return linearTicks(in: range, targetCount: targetCount)
+        }
+    }
+
+    private func pseudoLogAxisTicks(in range: ClosedRange<Float>, targetCount: Int) -> [AxisTick] {
+        guard range.lowerBound.isFinite, range.upperBound.isFinite, range.upperBound > range.lowerBound else {
+            return []
+        }
+
+        let lowerPower = Int(ceil(range.lowerBound))
+        let upperPower = Int(floor(range.upperBound))
+        guard lowerPower <= upperPower else { return [] }
+        let powers = Array(lowerPower...upperPower)
+        let stride = max(1, Int(ceil(Double(max(1, powers.count)) / Double(max(2, targetCount)))))
+
+        return powers.compactMap { power in
+            guard power == 0 || abs(power) % stride == 0 else { return nil }
+            let value = Float(power)
+            guard value >= range.lowerBound, value <= range.upperBound else { return nil }
+            return AxisTick(value: value, label: pseudoLogLabel(forPower: power))
+        }
+    }
+
+    private func pseudoLogLabel(forPower power: Int) -> String {
+        if power == 0 {
+            return "0"
+        }
+        if power < 0 {
+            return "-10^\(abs(power))"
+        }
+        return "10^\(power)"
+    }
+
+    private func linearTicks(in range: ClosedRange<Float>, targetCount: Int) -> [AxisTick] {
+        guard range.lowerBound.isFinite, range.upperBound.isFinite, range.upperBound > range.lowerBound else {
+            return [AxisTick(value: range.lowerBound, label: formatLinearTick(range.lowerBound))]
+        }
+
+        let span = range.upperBound - range.lowerBound
+        let step = niceStep(span / Float(max(1, targetCount - 1)))
+        let first = ceil(range.lowerBound / step) * step
+        var value = first
+        var output: [AxisTick] = []
+        let end = range.upperBound + step * 0.25
+
+        while value <= end, output.count < 16 {
+            if value >= range.lowerBound - step * 0.25 {
+                let normalized = abs(value) < step * 0.0001 ? 0 : value
+                output.append(AxisTick(value: normalized, label: formatLinearTick(normalized)))
+            }
+            value += step
+        }
+
+        return output.isEmpty ? [AxisTick(value: range.lowerBound, label: formatLinearTick(range.lowerBound))] : output
+    }
+
+    private func niceStep(_ value: Float) -> Float {
+        guard value.isFinite, value > 0 else { return 1 }
+        let exponent = floor(log10(value))
+        let magnitude = pow(Float(10), exponent)
+        let fraction = value / magnitude
+        let niceFraction: Float
+        if fraction <= 1 {
+            niceFraction = 1
+        } else if fraction <= 2 {
+            niceFraction = 2
+        } else if fraction <= 2.5 {
+            niceFraction = 2.5
+        } else if fraction <= 5 {
+            niceFraction = 5
+        } else {
+            niceFraction = 10
+        }
+        return niceFraction * magnitude
+    }
+
+    private func formatLinearTick(_ value: Float) -> String {
+        guard value.isFinite else { return "" }
+        let rounded = value.rounded()
+        if abs(value - rounded) < 0.001 {
+            return Int(rounded).formatted()
+        }
+        if abs(value) >= 100 {
+            return String(format: "%.0f", Double(value))
+        }
+        if abs(value) >= 10 {
+            return String(format: "%.1f", Double(value))
+        }
+        return String(format: "%.2g", Double(value))
     }
 
     private func axisMenu(
