@@ -6,7 +6,9 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var workspace = WorkspaceModel()
-    @State private var selectedRowID: String?
+    @State private var selectedRowIDs: Set<String> = []
+    @State private var focusedRowID: String?
+    @State private var selectionAnchorRowID: String?
     @State private var editingRowID: String?
     @State private var editName = ""
 
@@ -18,18 +20,27 @@ struct ContentView: View {
         .frame(minWidth: 760, minHeight: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            selectedRowID = workspace.selected.map { workspace.rowID(sampleID: $0.sampleID, gateID: $0.gateID) }
-        }
-        .onChange(of: selectedRowID) {
-            guard let selectedRowID, let row = workspace.rows.first(where: { $0.id == selectedRowID }) else { return }
-            workspace.selected = row.selection
+            syncSelectionFromWorkspace()
         }
         .onChange(of: workspace.selected) {
-            selectedRowID = workspace.selected.map { workspace.rowID(sampleID: $0.sampleID, gateID: $0.gateID) }
+            syncSelectionFromWorkspace()
+        }
+        .onChange(of: selectedRowIDs) {
+            syncWorkspaceFromSelection()
         }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
             handleFileDrop(providers)
         }
+        .onDeleteCommand {
+            deleteSelected()
+        }
+        .background(
+            DeleteKeyMonitor {
+                guard editingRowID == nil, currentRow != nil else { return false }
+                deleteSelected()
+                return true
+            }
+        )
     }
 
     private var ribbon: some View {
@@ -69,6 +80,7 @@ struct ContentView: View {
                     Label("Delete", systemImage: "trash")
                 }
                 .disabled(currentRow == nil)
+                .keyboardShortcut(.delete, modifiers: [])
 
                 Button {
                     workspace.applySelectedGateToAllSamples()
@@ -98,7 +110,7 @@ struct ContentView: View {
             Divider()
             tableHeader
 
-            List(selection: $selectedRowID) {
+            List(selection: $selectedRowIDs) {
                 ForEach(workspace.rows) { row in
                     WorkspaceRowView(
                         row: row,
@@ -110,9 +122,12 @@ struct ContentView: View {
                         }
                     )
                     .tag(row.id)
-                    .onTapGesture(count: 2) {
-                        workspace.openPlotWindow(for: row.selection)
-                    }
+                    .contentShape(Rectangle())
+                    .background(
+                        RowClickMonitor { clickCount, modifiers in
+                            handleRowMouseDown(row, clickCount: clickCount, modifiers: modifiers)
+                        }
+                    )
                     .contextMenu {
                         Button("Open") {
                             workspace.openPlotWindow(for: row.selection)
@@ -121,16 +136,16 @@ struct ContentView: View {
                             beginRename(row: row)
                         }
                         Button(role: .destructive) {
-                            workspace.delete(row.selection)
+                            delete(row: row)
                         } label: {
                             Text("Delete")
                         }
                     }
                     .onDrag {
-                        if let payload = workspace.dragPayload(for: row) {
-                            return NSItemProvider(object: payload as NSString)
+                        if let payload = workspace.dragPayload(for: row, selectedRows: selectedRowsForDrag(startingAt: row)) {
+                            return gateItemProvider(payload)
                         }
-                        return NSItemProvider(object: "" as NSString)
+                        return NSItemProvider()
                     }
                     .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
                         handleGateDrop(providers, target: row.selection)
@@ -139,7 +154,7 @@ struct ContentView: View {
             }
             .listStyle(.plain)
             .overlay {
-                if workspace.rows.isEmpty {
+                if workspace.samples.isEmpty {
                     VStack(spacing: 10) {
                         Image(systemName: "tray.and.arrow.down")
                             .font(.largeTitle)
@@ -188,6 +203,47 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .frame(height: 32)
+            .contentShape(Rectangle())
+            .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
+                handleGateDrop(providers, target: .allSamples)
+            }
+
+            ForEach(workspace.groupRows) { row in
+                WorkspaceRowView(
+                    row: row,
+                    isEditing: editingRowID == row.id,
+                    editName: $editName,
+                    onCommitRename: {
+                        workspace.rename(row.selection, to: editName)
+                        editingRowID = nil
+                    }
+                )
+                .contentShape(Rectangle())
+                .background(
+                    RowClickMonitor { clickCount, modifiers in
+                        handleRowMouseDown(row, clickCount: clickCount, modifiers: modifiers)
+                    }
+                )
+                .contextMenu {
+                    Button("Rename") {
+                        beginRename(row: row)
+                    }
+                    Button(role: .destructive) {
+                        delete(row: row)
+                    } label: {
+                        Text("Delete")
+                    }
+                }
+                .onDrag {
+                    if let payload = workspace.dragPayload(for: row, selectedRows: selectedRowsForDrag(startingAt: row)) {
+                        return gateItemProvider(payload)
+                    }
+                    return NSItemProvider()
+                }
+                .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
+                    handleGateDrop(providers, target: row.selection)
+                }
+            }
         }
     }
 
@@ -207,8 +263,17 @@ struct ContentView: View {
     }
 
     private var currentRow: WorkspaceRow? {
-        guard let selectedRowID else { return nil }
-        return workspace.rows.first { $0.id == selectedRowID }
+        if let focusedRowID, selectedRowIDs.contains(focusedRowID), let row = workspace.rows.first(where: { $0.id == focusedRowID }) {
+            return row
+        }
+        if let focusedRowID, selectedRowIDs.contains(focusedRowID), let row = workspace.groupRows.first(where: { $0.id == focusedRowID }) {
+            return row
+        }
+        return allRows.first { selectedRowIDs.contains($0.id) }
+    }
+
+    private var allRows: [WorkspaceRow] {
+        workspace.groupRows + workspace.rows
     }
 
     private func beginRename() {
@@ -217,15 +282,77 @@ struct ContentView: View {
     }
 
     private func beginRename(row: WorkspaceRow) {
-        selectedRowID = row.id
+        selectOnly(row)
         editingRowID = row.id
         editName = row.name
     }
 
     private func deleteSelected() {
-        guard let row = currentRow else { return }
+        let rows = selectedRowsForDeletion()
+        guard !rows.isEmpty else { return }
+        if rows.count == 1 {
+            delete(row: rows[0])
+            return
+        }
+        guard confirmDelete(rows: rows) else { return }
+        for row in rows {
+            workspace.delete(row.selection)
+        }
+        selectedRowIDs.removeAll()
+        focusedRowID = nil
+        selectionAnchorRowID = nil
+        editingRowID = nil
+    }
+
+    private func delete(row: WorkspaceRow) {
+        selectOnly(row)
+        guard confirmDelete(row: row) else { return }
         workspace.delete(row.selection)
         editingRowID = nil
+    }
+
+    private func confirmDelete(row: WorkspaceRow) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = row.isGroupGate
+            ? "Delete all-samples gate \"\(row.name)\"?"
+            : row.isGate ? "Delete gate \"\(row.name)\"?" : "Delete sample \"\(row.name)\"?"
+        alert.informativeText = row.isGroupGate
+            ? "This will remove the gate template from All Samples."
+            : row.isGate
+                ? "This will remove the gate and any child gates from the workspace."
+                : "This will remove the sample and any gates under it from the workspace."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func confirmDelete(rows: [WorkspaceRow]) -> Bool {
+        let sampleCount = rows.filter { !$0.isGate && !$0.isGroupGate }.count
+        let gateCount = rows.filter(\.isGate).count
+        let itemText = rows.count == 1 ? "item" : "items"
+        let detailParts = [
+            sampleCount > 0 ? "\(sampleCount) sample\(sampleCount == 1 ? "" : "s")" : nil,
+            gateCount > 0 ? "\(gateCount) gate\(gateCount == 1 ? "" : "s")" : nil
+        ].compactMap { $0 }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete \(rows.count) \(itemText)?"
+        alert.informativeText = detailParts.isEmpty
+            ? "This will remove the selected items from the workspace."
+            : "This will remove \(detailParts.joined(separator: " and ")) from the workspace. Any child gates under selected items will also be removed."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func selectedRowsForDeletion() -> [WorkspaceRow] {
+        let rows = allRows.filter { selectedRowIDs.contains($0.id) }
+        if !rows.isEmpty {
+            return rows
+        }
+        return currentRow.map { [$0] } ?? []
     }
 
     private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -242,10 +369,114 @@ struct ContentView: View {
         return true
     }
 
+    private func syncSelectionFromWorkspace() {
+        guard let selection = workspace.selected else {
+            selectedRowIDs.removeAll()
+            focusedRowID = nil
+            selectionAnchorRowID = nil
+            return
+        }
+        let rowID = workspace.rowID(sampleID: selection.sampleID, gateID: selection.gateID)
+        guard !selectedRowIDs.contains(rowID) || focusedRowID != rowID else { return }
+        selectedRowIDs = [rowID]
+        focusedRowID = rowID
+        selectionAnchorRowID = rowID
+    }
+
+    private func syncWorkspaceFromSelection() {
+        guard !selectedRowIDs.isEmpty else {
+            focusedRowID = nil
+            workspace.selected = nil
+            return
+        }
+        if let focusedRowID, selectedRowIDs.contains(focusedRowID), let row = allRows.first(where: { $0.id == focusedRowID }) {
+            workspace.selected = row.selection
+            return
+        }
+        guard let row = allRows.first(where: { selectedRowIDs.contains($0.id) }) else { return }
+        focusedRowID = row.id
+        selectionAnchorRowID = row.id
+        workspace.selected = row.selection
+    }
+
+    private func selectRow(_ row: WorkspaceRow, modifiers: NSEvent.ModifierFlags? = nil) {
+        let flags = modifiers?.intersection(.deviceIndependentFlagsMask)
+            ?? NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            ?? []
+        if flags.contains(.command) {
+            if selectedRowIDs.contains(row.id) {
+                selectedRowIDs.remove(row.id)
+                if focusedRowID == row.id {
+                    focusedRowID = allRows.first { selectedRowIDs.contains($0.id) }?.id
+                }
+            } else {
+                selectedRowIDs.insert(row.id)
+                focusedRowID = row.id
+            }
+            selectionAnchorRowID = row.id
+        } else if flags.contains(.shift), let anchor = selectionAnchorRowID {
+            selectedRowIDs = rowIDsBetween(anchor, row.id)
+            focusedRowID = row.id
+        } else {
+            selectedRowIDs = [row.id]
+            focusedRowID = row.id
+            selectionAnchorRowID = row.id
+        }
+        if let focusedRowID, let focusedRow = allRows.first(where: { $0.id == focusedRowID }) {
+            workspace.selected = focusedRow.selection
+        } else {
+            workspace.selected = nil
+        }
+    }
+
+    private func handleRowMouseDown(_ row: WorkspaceRow, clickCount: Int, modifiers: NSEvent.ModifierFlags) {
+        if clickCount >= 2 {
+            selectOnly(row)
+            workspace.openPlotWindow(for: row.selection)
+            return
+        }
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        if row.isGate,
+           selectedRowIDs.count > 1,
+           selectedRowIDs.contains(row.id),
+           !flags.contains(.command),
+           !flags.contains(.shift) {
+            focusedRowID = row.id
+            workspace.selected = row.selection
+            return
+        }
+        selectRow(row, modifiers: modifiers)
+    }
+
+    private func selectOnly(_ row: WorkspaceRow) {
+        selectedRowIDs = [row.id]
+        focusedRowID = row.id
+        selectionAnchorRowID = row.id
+        workspace.selected = row.selection
+    }
+
+    private func rowIDsBetween(_ first: String, _ second: String) -> Set<String> {
+        let rows = allRows
+        guard let firstIndex = rows.firstIndex(where: { $0.id == first }),
+              let secondIndex = rows.firstIndex(where: { $0.id == second }) else {
+            return [second]
+        }
+        let range = min(firstIndex, secondIndex)...max(firstIndex, secondIndex)
+        return Set(rows[range].map(\.id))
+    }
+
+    private func selectedRowsForDrag(startingAt row: WorkspaceRow) -> [WorkspaceRow] {
+        let selectedRows = allRows.filter { selectedRowIDs.contains($0.id) && $0.isGate }
+        if row.isGate, selectedRowIDs.contains(row.id), !selectedRows.isEmpty {
+            return selectedRows
+        }
+        return row.isGate ? [row] : []
+    }
+
     private func handleGateDrop(_ providers: [NSItemProvider], target: WorkspaceSelection) -> Bool {
         for provider in providers {
             provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                let payload = (item as? String) ?? (item as? NSString).map(String.init)
+                let payload = gatePayload(from: item)
                 if let payload {
                     Task { @MainActor in
                         workspace.copyGate(dragPayload: payload, to: target)
@@ -255,6 +486,120 @@ struct ContentView: View {
         }
         return true
     }
+}
+
+private struct RowClickMonitor: NSViewRepresentable {
+    var onMouseDown: (Int, NSEvent.ModifierFlags) -> Void
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.onMouseDown = onMouseDown
+        return view
+    }
+
+    func updateNSView(_ nsView: MonitorView, context: Context) {
+        nsView.onMouseDown = onMouseDown
+    }
+
+    final class MonitorView: NSView {
+        var onMouseDown: ((Int, NSEvent.ModifierFlags) -> Void)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil {
+                removeMonitor()
+            } else {
+                installMonitor()
+            }
+        }
+
+        private func installMonitor() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+                guard let self, let window = self.window, event.window === window else { return event }
+                let point = self.convert(event.locationInWindow, from: nil)
+                if self.bounds.contains(point) {
+                    self.onMouseDown?(event.clickCount, event.modifierFlags)
+                }
+                return event
+            }
+        }
+
+        private func removeMonitor() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+    }
+}
+
+private struct DeleteKeyMonitor: NSViewRepresentable {
+    var onDelete: () -> Bool
+
+    func makeNSView(context: Context) -> MonitorView {
+        let view = MonitorView()
+        view.onDelete = onDelete
+        return view
+    }
+
+    func updateNSView(_ nsView: MonitorView, context: Context) {
+        nsView.onDelete = onDelete
+    }
+
+    final class MonitorView: NSView {
+        var onDelete: (() -> Bool)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil {
+                removeMonitor()
+            } else {
+                installMonitor()
+            }
+        }
+
+        private func installMonitor() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+                guard let self, let window = self.window, event.window === window else { return event }
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                guard flags.isEmpty, event.keyCode == 51 || event.keyCode == 117 else { return event }
+                return self.onDelete?() == true ? nil : event
+            }
+        }
+
+        private func removeMonitor() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+    }
+}
+
+private nonisolated func gateItemProvider(_ payload: String) -> NSItemProvider {
+    let provider = NSItemProvider()
+    provider.registerDataRepresentation(forTypeIdentifier: UTType.plainText.identifier, visibility: .all) { completion in
+        completion(Data(payload.utf8), nil)
+        return nil
+    }
+    return provider
+}
+
+private nonisolated func gatePayload(from item: NSSecureCoding?) -> String? {
+    if let string = item as? String {
+        return string
+    }
+    if let string = item as? NSString {
+        return string as String
+    }
+    if let data = item as? Data {
+        return String(data: data, encoding: .utf8)
+    }
+    return nil
 }
 
 private nonisolated func droppedFileURL(from item: NSSecureCoding?) -> URL? {
@@ -293,18 +638,20 @@ private struct WorkspaceRowView: View {
                 } else {
                     Text(row.name)
                         .lineLimit(1)
+                        .fontWeight(row.isSynced ? .semibold : .regular)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(row.isGate ? "Count" : "Events")
+            Text(row.isGroupGate ? "Template" : row.isGate ? "Count" : "Events")
                 .foregroundStyle(.secondary)
                 .frame(width: 100, alignment: .trailing)
 
-            Text(row.count.map { $0.formatted() } ?? "...")
+            Text(row.isGroupGate ? "" : row.count.map { $0.formatted() } ?? "...")
                 .frame(width: 96, alignment: .trailing)
         }
         .font(.callout)
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
     }
 }

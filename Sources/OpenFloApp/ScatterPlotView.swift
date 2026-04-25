@@ -2,15 +2,22 @@ import AppKit
 import OpenFloCore
 import SwiftUI
 
+struct PlotGateOverlay: Identifiable, Equatable {
+    let id: String
+    let gate: PolygonGate
+}
+
 struct ScatterPlotView: View {
     let image: NSImage?
     let xRange: ClosedRange<Float>
     let yRange: ClosedRange<Float>
-    let gate: PolygonGate?
+    let gates: [PlotGateOverlay]
+    let selectedGateID: String?
     let gateTool: GateTool
     let plotMode: PlotMode
     let xTransform: TransformKind
     let yTransform: TransformKind
+    let isGateSelected: Bool
     let gateLabelPosition: PlotPoint?
     let gatePercentText: String
     let channels: [Channel]
@@ -20,10 +27,12 @@ struct ScatterPlotView: View {
     let onYChannelChange: (Int) -> Void
     let onPlotModeChange: (PlotMode) -> Void
     let onGate: (PolygonGate) -> Void
+    let onGateSelected: (String) -> Void
+    let onGateDeselected: () -> Void
     let onGateChanged: (PolygonGate) -> Void
     let onGateEditEnded: (PolygonGate) -> Void
     let onGateLabelMoved: (PlotPoint) -> Void
-    let onOpenGate: (PlotPoint) -> Void
+    let onOpenGate: (String, PlotPoint) -> Void
 
     @State private var dragStart: CGPoint?
     @State private var dragCurrent: CGPoint?
@@ -42,6 +51,11 @@ struct ScatterPlotView: View {
         let label: String
     }
 
+    private var selectedGate: PolygonGate? {
+        guard let selectedGateID else { return nil }
+        return gates.first { $0.id == selectedGateID }?.gate
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let plotRect = squarePlotRect(in: geometry.size)
@@ -58,13 +72,13 @@ struct ScatterPlotView: View {
                 }
 
                 Canvas { context, size in
-                    drawGate(context: context, plotRect: plotRect)
+                    drawGates(context: context, plotRect: plotRect)
                     drawDrag(context: context, plotRect: plotRect)
                     drawPolygonDraft(context: context, plotRect: plotRect)
                     drawAxes(context: context, plotRect: plotRect)
                 }
 
-                if let gateLabelPosition, !gatePercentText.isEmpty {
+                if isGateSelected, let gateLabelPosition, !gatePercentText.isEmpty {
                     let center = labelCenter(for: gateLabelPosition, in: plotRect)
                     Text(gatePercentText)
                         .font(.caption.weight(.semibold))
@@ -120,6 +134,10 @@ struct ScatterPlotView: View {
                 polygonPreview = nil
                 dragStart = nil
                 dragCurrent = nil
+                editState = nil
+                if gateTool != .cursor {
+                    onGateDeselected()
+                }
             }
             .onChange(of: xChannel) {
                 polygonVertices.removeAll()
@@ -185,7 +203,9 @@ struct ScatterPlotView: View {
             return
         }
 
-        onOpenGate(point)
+        if let hit = gateHit(at: point) {
+            onOpenGate(hit.id, point)
+        }
     }
 
     private func handleMouseDown(_ location: CGPoint, clickCount: Int, plotRect: CGRect) {
@@ -236,7 +256,7 @@ struct ScatterPlotView: View {
 
     private func handleMouseUp(_ location: CGPoint, plotRect: CGRect) {
         if gateTool == .cursor {
-            if let editState, let gate {
+            if let editState, let gate = selectedGate {
                 switch editState {
                 case .vertex, .move:
                     onGateEditEnded(gate)
@@ -270,8 +290,30 @@ struct ScatterPlotView: View {
     }
 
     private func beginGateEdit(at location: CGPoint, plotRect: CGRect) {
-        guard let gate else { return }
-        if labelFrame(in: plotRect)?.contains(location) == true {
+        guard !gates.isEmpty else {
+            onGateDeselected()
+            return
+        }
+
+        let point = dataPoint(for: clamp(location, to: plotRect), in: plotRect)
+        let clickedLabel = labelFrame(in: plotRect)?.contains(location) == true
+        let hit = clickedLabel
+            ? selectedGateID.flatMap { selectedID in gates.first { $0.id == selectedID } }
+            : gateHit(at: point)
+        guard let hit else {
+            editState = nil
+            onGateDeselected()
+            return
+        }
+
+        onGateSelected(hit.id)
+        guard isGateSelected, selectedGateID == hit.id else {
+            editState = nil
+            return
+        }
+
+        let gate = hit.gate
+        if clickedLabel {
             editState = .label
             return
         }
@@ -280,22 +322,16 @@ struct ScatterPlotView: View {
             editState = .vertex(index: vertexIndex)
             return
         }
-
-        let point = dataPoint(for: clamp(location, to: plotRect), in: plotRect)
-        if gate.contains(x: point.x, y: point.y) {
-            editState = .move(start: point, originalVertices: gate.vertices)
-        }
+        editState = .move(start: point, originalVertices: gate.vertices)
     }
 
     private func updateGateEdit(at location: CGPoint, plotRect: CGRect) {
-        guard let editState, let gate else { return }
+        guard let editState, let gate = selectedGate else { return }
         let point = dataPoint(for: clamp(location, to: plotRect), in: plotRect)
         switch editState {
         case .vertex(let index):
             guard gate.vertices.indices.contains(index) else { return }
-            var vertices = gate.vertices
-            vertices[index] = point
-            onGateChanged(PolygonGate(name: gate.name, vertices: vertices, kind: gate.kind))
+            onGateChanged(gateByMovingVertex(index, of: gate, to: point))
         case .move(let start, let originalVertices):
             let dx = point.x - start.x
             let dy = point.y - start.y
@@ -304,6 +340,111 @@ struct ScatterPlotView: View {
         case .label:
             onGateLabelMoved(point)
         }
+    }
+
+    private func gateByMovingVertex(_ index: Int, of gate: PolygonGate, to point: PlotPoint) -> PolygonGate {
+        switch gate.kind {
+        case .rectangle:
+            let opposite = gate.vertices.indices.contains((index + 2) % gate.vertices.count)
+                ? gate.vertices[(index + 2) % gate.vertices.count]
+                : oppositeCorner(of: gate.vertices, from: point)
+            return PolygonGate.rectangle(
+                name: gate.name,
+                xRange: min(opposite.x, point.x)...max(opposite.x, point.x),
+                yRange: min(opposite.y, point.y)...max(opposite.y, point.y)
+            )
+        case .ellipse:
+            return resizedEllipse(gate, movingVertex: index, to: point)
+        case .xCutoff:
+            var vertices = gate.vertices
+            vertices[index] = point
+            let bounds = boundingRanges(for: vertices)
+            return PolygonGate.xCutoff(
+                name: gate.name,
+                threshold: bounds.x.lowerBound,
+                xUpper: bounds.x.upperBound,
+                yRange: bounds.y
+            )
+        case .quadrant:
+            var vertices = gate.vertices
+            vertices[index] = point
+            let bounds = boundingRanges(for: vertices)
+            return PolygonGate.quadrant(
+                name: gate.name,
+                origin: PlotPoint(x: bounds.x.lowerBound, y: bounds.y.lowerBound),
+                xUpper: bounds.x.upperBound,
+                yUpper: bounds.y.upperBound
+            )
+        case .polygon:
+            var vertices = gate.vertices
+            vertices[index] = point
+            return PolygonGate(name: gate.name, vertices: vertices, kind: gate.kind)
+        }
+    }
+
+    private func boundingRanges(for vertices: [PlotPoint]) -> (x: ClosedRange<Float>, y: ClosedRange<Float>) {
+        let xs = vertices.map(\.x)
+        let ys = vertices.map(\.y)
+        let xLower = xs.min() ?? xRange.lowerBound
+        let xUpper = xs.max() ?? xRange.upperBound
+        let yLower = ys.min() ?? yRange.lowerBound
+        let yUpper = ys.max() ?? yRange.upperBound
+        return (xLower...xUpper, yLower...yUpper)
+    }
+
+    private func resizedEllipse(_ gate: PolygonGate, movingVertex index: Int, to point: PlotPoint) -> PolygonGate {
+        let bounds = boundingRanges(for: gate.vertices)
+        guard gate.vertices.indices.contains(index) else { return gate }
+        let original = gate.vertices[index]
+        let centerX = (bounds.x.lowerBound + bounds.x.upperBound) / 2
+        let centerY = (bounds.y.lowerBound + bounds.y.upperBound) / 2
+        let radiusX = max((bounds.x.upperBound - bounds.x.lowerBound) / 2, Float.leastNonzeroMagnitude)
+        let radiusY = max((bounds.y.upperBound - bounds.y.lowerBound) / 2, Float.leastNonzeroMagnitude)
+        let xDirection = (original.x - centerX) / radiusX
+        let yDirection = (original.y - centerY) / radiusY
+        let controlsX = abs(xDirection) >= 0.35 || abs(yDirection) < 0.35
+        let controlsY = abs(yDirection) >= 0.35 || abs(xDirection) < 0.35
+
+        var xLower = bounds.x.lowerBound
+        var xUpper = bounds.x.upperBound
+        var yLower = bounds.y.lowerBound
+        var yUpper = bounds.y.upperBound
+
+        if controlsX {
+            if xDirection >= 0 {
+                xUpper = point.x
+            } else {
+                xLower = point.x
+            }
+        }
+        if controlsY {
+            if yDirection >= 0 {
+                yUpper = point.y
+            } else {
+                yLower = point.y
+            }
+        }
+
+        return PolygonGate.ellipse(
+            name: gate.name,
+            xRange: min(xLower, xUpper)...max(xLower, xUpper),
+            yRange: min(yLower, yUpper)...max(yLower, yUpper),
+            segments: max(12, gate.vertices.count)
+        )
+    }
+
+    private func oppositeCorner(of vertices: [PlotPoint], from point: PlotPoint) -> PlotPoint {
+        let bounds = boundingRanges(for: vertices)
+        let xMid = (bounds.x.lowerBound + bounds.x.upperBound) / 2
+        let yMid = (bounds.y.lowerBound + bounds.y.upperBound) / 2
+        return PlotPoint(
+            x: point.x < xMid ? bounds.x.upperBound : bounds.x.lowerBound,
+            y: point.y < yMid ? bounds.y.upperBound : bounds.y.lowerBound
+        )
+    }
+
+    private func gateHit(at point: PlotPoint) -> PlotGateOverlay? {
+        gates.reversed().first { $0.gate.contains(x: point.x, y: point.y) }
     }
 
     private func nearestVertex(to location: CGPoint, gate: PolygonGate, plotRect: CGRect) -> Int? {
@@ -350,8 +491,16 @@ struct ScatterPlotView: View {
         )
     }
 
-    private func drawGate(context: GraphicsContext, plotRect: CGRect) {
-        guard let gate else { return }
+    private func drawGates(context: GraphicsContext, plotRect: CGRect) {
+        for overlay in gates where overlay.id != selectedGateID {
+            drawGate(overlay.gate, isSelected: false, context: context, plotRect: plotRect)
+        }
+        if let selectedGateID, let selected = gates.first(where: { $0.id == selectedGateID }) {
+            drawGate(selected.gate, isSelected: isGateSelected, context: context, plotRect: plotRect)
+        }
+    }
+
+    private func drawGate(_ gate: PolygonGate, isSelected: Bool, context: GraphicsContext, plotRect: CGRect) {
         var path = Path()
         for (index, vertex) in gate.vertices.enumerated() {
             let point = viewPoint(for: vertex, in: plotRect)
@@ -362,15 +511,14 @@ struct ScatterPlotView: View {
             }
         }
         path.closeSubpath()
-        context.fill(path, with: .color(.cyan.opacity(0.12)))
-        context.stroke(path, with: .color(.cyan.opacity(0.9)), lineWidth: 2)
+        context.stroke(path, with: .color(.black), lineWidth: 2)
 
-        if gateTool == .cursor {
+        if gateTool == .cursor, isSelected {
             for vertex in gate.vertices {
                 let point = viewPoint(for: vertex, in: plotRect)
                 let rect = CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)
                 context.fill(Path(ellipseIn: rect), with: .color(.white))
-                context.stroke(Path(ellipseIn: rect), with: .color(.cyan.opacity(0.95)), lineWidth: 1.5)
+                context.stroke(Path(ellipseIn: rect), with: .color(.black), lineWidth: 1.5)
             }
         }
     }
@@ -385,10 +533,8 @@ struct ScatterPlotView: View {
         ).intersection(plotRect)
         switch gateTool {
         case .rectangle:
-            context.fill(Path(rect), with: .color(.black.opacity(0.08)))
             context.stroke(Path(rect), with: .color(.black), lineWidth: 1.5)
         case .oval:
-            context.fill(Path(ellipseIn: rect), with: .color(.black.opacity(0.08)))
             context.stroke(Path(ellipseIn: rect), with: .color(.black), lineWidth: 1.5)
         case .cursor, .polygon, .xCutoff, .quadrant:
             break
@@ -607,10 +753,10 @@ struct ScatterPlotView: View {
             }
             .font(.caption)
             .foregroundStyle(.black)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(.white.opacity(0.86), in: Capsule())
-            .overlay(Capsule().stroke(.black.opacity(0.25), lineWidth: 1))
+            .padding(.horizontal, 10)
+            .frame(minWidth: 150, minHeight: 25)
+            .background(Color(nsColor: .controlColor))
+            .overlay(Rectangle().stroke(.black.opacity(0.55), lineWidth: 1))
         }
         .menuStyle(.borderlessButton)
         .fixedSize()

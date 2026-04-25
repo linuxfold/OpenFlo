@@ -12,6 +12,8 @@ public struct PlotPoint: Equatable, Sendable {
 
 public enum GateKind: String, Equatable, Sendable {
     case polygon
+    case rectangle
+    case ellipse
     case xCutoff
     case quadrant
 }
@@ -36,7 +38,8 @@ public struct PolygonGate: Equatable, Sendable {
                 PlotPoint(x: xRange.upperBound, y: yRange.lowerBound),
                 PlotPoint(x: xRange.upperBound, y: yRange.upperBound),
                 PlotPoint(x: xRange.lowerBound, y: yRange.upperBound)
-            ]
+            ],
+            kind: .rectangle
         )
     }
 
@@ -84,7 +87,7 @@ public struct PolygonGate: Equatable, Sendable {
                 y: centerY + sin(angle) * radiusY
             )
         }
-        return PolygonGate(name: name, vertices: vertices)
+        return PolygonGate(name: name, vertices: vertices, kind: .ellipse)
     }
 
     public func contains(x: Float, y: Float) -> Bool {

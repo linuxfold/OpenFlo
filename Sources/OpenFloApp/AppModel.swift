@@ -64,6 +64,7 @@ final class AppModel: ObservableObject {
     private var projectedX: [Float] = []
     private var projectedY: [Float] = []
     private var renderGeneration = 0
+    private var pendingGateEvaluation: PolygonGate?
 
     init(
         table: EventTable = EventTable.synthetic(events: 750_000),
@@ -179,9 +180,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func axesChanged() {
+    func axesChanged(restoredGate: PolygonGate? = nil) {
         xTransform = Self.defaultTransform(for: channels[xChannel])
         yTransform = Self.defaultTransform(for: channels[yChannel])
+        pendingGateEvaluation = restoredGate
         clearGate(recompute: false)
         recomputePlot(reason: "Axes updated")
     }
@@ -256,6 +258,10 @@ final class AppModel: ObservableObject {
                 } else {
                     self.status = "\(reason). \(self.visibleEventCount.formatted()) visible events, \(table.channelCount) channels."
                 }
+                if let pendingGate = self.pendingGateEvaluation {
+                    self.pendingGateEvaluation = nil
+                    self.applyGate(pendingGate)
+                }
             }
         }
     }
@@ -267,11 +273,15 @@ final class AppModel: ObservableObject {
         preferredXChannelName: String? = nil,
         preferredYChannelName: String? = nil,
         preferredXTransform: TransformKind? = nil,
-        preferredYTransform: TransformKind? = nil
+        preferredYTransform: TransformKind? = nil,
+        restoredGate: PolygonGate? = nil
     ) {
         self.table = table
         self.baseMask = baseMask
         self.populationTitle = title
+        pendingGateEvaluation = restoredGate
+        projectedX = []
+        projectedY = []
         if let preferredXChannelName, let index = channelIndex(named: preferredXChannelName, in: table) {
             xChannel = index
         } else if xChannel >= table.channelCount {
@@ -317,6 +327,20 @@ final class AppModel: ObservableObject {
         activeGate = gate
         guard reevaluate else { return }
         applyGate(gate, resetLabel: false)
+    }
+
+    func showGateOverlay(_ gate: PolygonGate) {
+        activeGate = gate
+        gateMask = nil
+        gateLabelPosition = defaultLabelPosition(for: gate)
+    }
+
+    func restoreGateWhenReady(_ gate: PolygonGate) {
+        if projectedX.count == table.rowCount, projectedY.count == table.rowCount {
+            applyGate(gate)
+        } else {
+            pendingGateEvaluation = gate
+        }
     }
 
     func moveGateLabel(to point: PlotPoint) {
@@ -411,9 +435,17 @@ final class AppModel: ObservableObject {
     }
 
     private func channelIndex(named name: String, in table: EventTable) -> Int? {
-        table.channels.firstIndex { channel in
-            channel.name == name || channel.displayName == name
+        let normalizedName = normalizedChannelName(name)
+        return table.channels.firstIndex { channel in
+            channel.name == name
+                || channel.displayName == name
+                || normalizedChannelName(channel.name) == normalizedName
+                || normalizedChannelName(channel.displayName) == normalizedName
         }
+    }
+
+    private func normalizedChannelName(_ name: String) -> String {
+        name.uppercased().filter { $0.isLetter || $0.isNumber }
     }
 
     private nonisolated static func histogramYRange(maxBin: UInt32) -> ClosedRange<Float> {

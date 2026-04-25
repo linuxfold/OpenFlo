@@ -4,28 +4,36 @@ import Foundation
 import OpenFloCore
 
 enum HeatmapRenderer {
-    static func image(from histogram: Histogram2D) -> NSImage {
-        var pixels = Array(repeating: UInt8(0), count: histogram.width * histogram.height * 4)
-        let densities = areaDensities(from: histogram)
-        let scale = densityScale(for: densities)
-        let denominator = log1p(max(scale.high - scale.floor, 1))
+    private static let densityCoolingGamma: Float = 1.32
+    private static let redDensityMultiplier: Float = 1.18
 
-        for y in 0..<histogram.height {
+    static func image(from histogram: Histogram2D) -> NSImage {
+        var pixels = Array(repeating: UInt8(255), count: histogram.width * histogram.height * 4)
+        var paintedDensities = Array(repeating: Float(0), count: histogram.width * histogram.height)
+        let densities = areaDensities(from: histogram)
+        let scale = densityScale(for: densities, occupiedBins: histogram.bins)
+        let low = log1p(max(scale.low, Float.leastNonzeroMagnitude))
+        let high = log1p(max(scale.high, scale.low + Float.leastNonzeroMagnitude))
+        let denominator = max(high - low, Float.leastNonzeroMagnitude)
+
+        for sourceY in 0..<histogram.height {
             for x in 0..<histogram.width {
-                let sourceY = histogram.height - 1 - y
-                let density = densities[sourceY * histogram.width + x]
-                let color: (r: UInt8, g: UInt8, b: UInt8)
-                if density <= scale.floor {
-                    color = (255, 255, 255)
-                } else {
-                    let normalized = log1p(min(density, scale.high) - scale.floor) / denominator
-                    color = colorMap(normalized)
-                }
-                let offset = (y * histogram.width + x) * 4
-                pixels[offset] = color.r
-                pixels[offset + 1] = color.g
-                pixels[offset + 2] = color.b
-                pixels[offset + 3] = 255
+                let sourceIndex = sourceY * histogram.width + x
+                guard histogram.bins[sourceIndex] > 0 else { continue }
+                let density = min(max(densities[sourceIndex], scale.low), scale.high)
+                let normalized = (log1p(density) - low) / denominator
+                let cooled = powf(normalized, densityCoolingGamma)
+                let color = colorMap(cooled)
+                paintSquare(
+                    centerX: x,
+                    centerY: histogram.height - 1 - sourceY,
+                    color: color,
+                    density: normalized,
+                    width: histogram.width,
+                    height: histogram.height,
+                    pixels: &pixels,
+                    paintedDensities: &paintedDensities
+                )
             }
         }
 
@@ -50,6 +58,32 @@ enum HeatmapRenderer {
         }
 
         return NSImage(cgImage: image, size: NSSize(width: histogram.width, height: histogram.height))
+    }
+
+    private static func paintSquare(
+        centerX: Int,
+        centerY: Int,
+        color: (r: UInt8, g: UInt8, b: UInt8),
+        density: Float,
+        width: Int,
+        height: Int,
+        pixels: inout [UInt8],
+        paintedDensities: inout [Float]
+    ) {
+        let xStart = min(max(0, centerX), max(0, width - 2))
+        let yStart = min(max(0, centerY), max(0, height - 2))
+        for y in yStart...min(height - 1, yStart + 1) {
+            for x in xStart...min(width - 1, xStart + 1) {
+                let pixelIndex = y * width + x
+                guard density >= paintedDensities[pixelIndex] else { continue }
+                paintedDensities[pixelIndex] = density
+                let offset = pixelIndex * 4
+                pixels[offset] = color.r
+                pixels[offset + 1] = color.g
+                pixels[offset + 2] = color.b
+                pixels[offset + 3] = 255
+            }
+        }
     }
 
     private static func areaDensities(from histogram: Histogram2D) -> [Float] {
@@ -78,21 +112,29 @@ enum HeatmapRenderer {
                     - integral[y0 * stride + x1 + 1]
                     - integral[(y1 + 1) * stride + x0]
                     + integral[y0 * stride + x0]
-                densities[y * width + x] = Float(max(areaCount, 0))
+                let area = max(1, (x1 - x0 + 1) * (y1 - y0 + 1))
+                densities[y * width + x] = Float(max(areaCount, 0)) / Float(area)
             }
         }
 
         return densities
     }
 
-    private static func densityScale(for densities: [Float]) -> (floor: Float, high: Float) {
-        var nonzero = densities.filter { $0 > 0 && $0.isFinite }
-        guard !nonzero.isEmpty else { return (1, 1) }
+    private static func densityScale(for densities: [Float], occupiedBins: [UInt32]) -> (low: Float, high: Float) {
+        var nonzero: [Float] = []
+        nonzero.reserveCapacity(min(densities.count, 4096))
+        for index in densities.indices where occupiedBins[index] > 0 {
+            let density = densities[index]
+            if density > 0, density.isFinite {
+                nonzero.append(density)
+            }
+        }
+        guard !nonzero.isEmpty else { return (0, 1) }
         nonzero.sort()
 
-        let high = max(percentile(0.99, in: nonzero), 1)
-        let floor = max(2, high * 0.004)
-        return (min(floor, high - 1), high)
+        let low = max(percentile(0.02, in: nonzero), Float.leastNonzeroMagnitude)
+        let high = max(percentile(0.995, in: nonzero) * redDensityMultiplier, low + Float.leastNonzeroMagnitude)
+        return (min(low, high), high)
     }
 
     private static func percentile(_ percentile: Float, in sortedValues: [Float]) -> Float {
@@ -104,15 +146,28 @@ enum HeatmapRenderer {
 
     private static func colorMap(_ value: Float) -> (r: UInt8, g: UInt8, b: UInt8) {
         let t = max(0, min(1, value))
-        let heat = smoothstep(edge0: 0.08, edge1: 1.0, x: t)
-        let r = 1.0
-        let g = 1.0 - 0.92 * heat
-        let b = 1.0 - 0.96 * heat
-        return (
-            UInt8(max(0, min(255, r * 255))),
-            UInt8(max(0, min(255, g * 255))),
-            UInt8(max(0, min(255, b * 255)))
-        )
+        let stops: [(Float, Float, Float, Float)] = [
+            (0.00, 0.00, 0.05, 1.00),
+            (0.38, 0.00, 0.90, 0.12),
+            (0.68, 1.00, 0.92, 0.00),
+            (1.00, 1.00, 0.00, 0.00)
+        ]
+        for index in 0..<(stops.count - 1) {
+            let start = stops[index]
+            let end = stops[index + 1]
+            guard t >= start.0, t <= end.0 else { continue }
+            let local = smoothstep(edge0: start.0, edge1: end.0, x: t)
+            return (
+                channel(start.1 + (end.1 - start.1) * local),
+                channel(start.2 + (end.2 - start.2) * local),
+                channel(start.3 + (end.3 - start.3) * local)
+            )
+        }
+        return (255, 0, 0)
+    }
+
+    private static func channel(_ value: Float) -> UInt8 {
+        UInt8(max(0, min(255, value * 255)))
     }
 
     private static func smoothstep(edge0: Float, edge1: Float, x: Float) -> Float {
