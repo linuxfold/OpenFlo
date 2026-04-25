@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import OpenFloCore
 import SwiftUI
@@ -63,9 +64,9 @@ struct PlotWindowView: View {
             Button {
                 navigateUp()
             } label: {
-                Image(systemName: "arrow.up")
+                Image(systemName: "chevron.left")
             }
-            .help("Show parent population")
+            .help("Back to parent population")
             .disabled(workspace.parentSelection(of: selection) == nil)
 
             Label(model.populationTitle, systemImage: "chart.dots.scatter")
@@ -75,14 +76,7 @@ struct PlotWindowView: View {
             Divider()
                 .frame(height: 24)
 
-            Picker("Gate Tool", selection: $model.gateTool) {
-                ForEach(GateTool.allCases) { tool in
-                    Label(tool.rawValue, systemImage: tool.systemImage)
-                        .tag(tool)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 540)
+            GateToolStrip(selection: $model.gateTool)
 
             Spacer()
 
@@ -105,8 +99,12 @@ struct PlotWindowView: View {
     }
 
     private func createGate(_ gate: PolygonGate) {
+        guard let namedGate = promptForGateName(gate) else {
+            model.gateTool = .cursor
+            return
+        }
         let newSelection = workspace.addGateFromPlot(
-            gate,
+            namedGate,
             xChannelName: model.currentXChannelName,
             yChannelName: model.currentYChannelName,
             xTransform: model.xTransform,
@@ -114,7 +112,7 @@ struct PlotWindowView: View {
             parentSelection: selection
         )
         activeGateSelection = newSelection
-        model.applyGate(gate)
+        model.applyGate(namedGate)
         model.gateTool = .cursor
     }
 
@@ -168,14 +166,7 @@ struct StandalonePlotPaneView: View {
                 Label(model.populationTitle, systemImage: "chart.dots.scatter")
                     .font(.headline)
                 Spacer()
-                Picker("Gate Tool", selection: $model.gateTool) {
-                    ForEach(GateTool.allCases) { tool in
-                        Label(tool.rawValue, systemImage: tool.systemImage)
-                            .tag(tool)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 420)
+                GateToolStrip(selection: $model.gateTool)
             }
             .padding(.horizontal, 12)
             .frame(height: 52)
@@ -208,7 +199,11 @@ struct StandalonePlotPaneView: View {
                     model.plotModeChanged(mode)
                 },
                 onGate: { gate in
-                    model.applyGate(gate)
+                    guard let namedGate = promptForGateName(gate) else {
+                        model.gateTool = .cursor
+                        return
+                    }
+                    model.applyGate(namedGate)
                     model.gateTool = .cursor
                 },
                 onGateChanged: { gate in
@@ -225,5 +220,112 @@ struct StandalonePlotPaneView: View {
                 }
             )
         }
+    }
+}
+
+@MainActor
+private func promptForGateName(_ gate: PolygonGate) -> PolygonGate? {
+    let alert = NSAlert()
+    alert.messageText = "Name Gate"
+    alert.informativeText = "Enter a name for the new gate."
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "Create")
+    alert.addButton(withTitle: "Cancel")
+
+    let textField = NSTextField(string: gate.name)
+    textField.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+    textField.selectText(nil)
+    alert.accessoryView = textField
+
+    let response = alert.runModal()
+    guard response == .alertFirstButtonReturn else { return nil }
+    let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    let name = trimmed.isEmpty ? gate.name : trimmed
+    return PolygonGate(name: name, vertices: gate.vertices, kind: gate.kind)
+}
+
+private struct GateToolStrip: View {
+    @Binding var selection: GateTool
+
+    private let tools: [GateTool] = [.cursor, .rectangle, .quadrant, .oval, .polygon]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(tools) { tool in
+                Button {
+                    selection = tool
+                } label: {
+                    GateToolGlyph(tool: tool)
+                        .frame(width: 27, height: 27)
+                        .frame(width: 42, height: 34)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.black)
+                .background(selection == tool ? Color(nsColor: .selectedControlColor).opacity(0.24) : Color(nsColor: .controlBackgroundColor))
+                .overlay(Rectangle().stroke(Color.black.opacity(selection == tool ? 0.45 : 0.22), lineWidth: 1))
+                .help(tool.rawValue)
+                .accessibilityLabel(tool.rawValue)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.black.opacity(0.25), lineWidth: 1))
+        .fixedSize()
+    }
+}
+
+private struct GateToolGlyph: View {
+    let tool: GateTool
+
+    var body: some View {
+        Canvas { context, size in
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 3, dy: 3)
+            switch tool {
+            case .cursor:
+                drawCursor(context: context, rect: rect)
+            case .rectangle:
+                context.stroke(Path(rect), with: .color(.black), lineWidth: 2)
+            case .quadrant:
+                var path = Path()
+                path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+                path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+                path.move(to: CGPoint(x: rect.minX, y: rect.midY))
+                path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+                context.stroke(path, with: .color(.black), lineWidth: 2.4)
+            case .oval:
+                context.stroke(Path(ellipseIn: rect), with: .color(.black), lineWidth: 2)
+            case .polygon:
+                drawCustomShape(context: context, rect: rect)
+            case .xCutoff:
+                var path = Path()
+                path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+                path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+                context.stroke(path, with: .color(.black), lineWidth: 2.4)
+            }
+        }
+    }
+
+    private func drawCursor(context: GraphicsContext, rect: CGRect) {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + 1, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + 1, y: rect.maxY - 1))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.38, y: rect.maxY - rect.height * 0.32))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.56, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.72, y: rect.maxY - rect.height * 0.08))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.54, y: rect.maxY - rect.height * 0.42))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - rect.height * 0.42))
+        path.closeSubpath()
+        context.fill(path, with: .color(.black))
+    }
+
+    private func drawCustomShape(context: GraphicsContext, rect: CGRect) {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + 1, y: rect.minY + 1))
+        path.addLine(to: CGPoint(x: rect.maxX - 1, y: rect.minY + 1))
+        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.28, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.maxX - 1, y: rect.maxY - 1))
+        path.addLine(to: CGPoint(x: rect.minX + 1, y: rect.maxY - 1))
+        path.closeSubpath()
+        context.stroke(path, with: .color(.black), lineWidth: 2)
     }
 }

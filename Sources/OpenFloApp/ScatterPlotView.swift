@@ -28,6 +28,7 @@ struct ScatterPlotView: View {
     @State private var dragStart: CGPoint?
     @State private var dragCurrent: CGPoint?
     @State private var polygonVertices: [PlotPoint] = []
+    @State private var polygonPreview: CGPoint?
     @State private var editState: GateEditState?
 
     private enum GateEditState {
@@ -85,6 +86,9 @@ struct ScatterPlotView: View {
                     },
                     onMouseUp: { point in
                         handleMouseUp(point, plotRect: plotRect)
+                    },
+                    onMouseMoved: { point in
+                        handleMouseMoved(point, plotRect: plotRect)
                     }
                 )
 
@@ -113,17 +117,21 @@ struct ScatterPlotView: View {
             .contentShape(Rectangle())
             .onChange(of: gateTool) {
                 polygonVertices.removeAll()
+                polygonPreview = nil
                 dragStart = nil
                 dragCurrent = nil
             }
             .onChange(of: xChannel) {
                 polygonVertices.removeAll()
+                polygonPreview = nil
             }
             .onChange(of: yChannel) {
                 polygonVertices.removeAll()
+                polygonPreview = nil
             }
             .onChange(of: plotMode) {
                 polygonVertices.removeAll()
+                polygonPreview = nil
                 dragStart = nil
                 dragCurrent = nil
             }
@@ -156,7 +164,9 @@ struct ScatterPlotView: View {
 
     private func handleSingleClick(_ location: CGPoint, plotRect: CGRect) {
         guard gateTool == .polygon, plotRect.contains(location) else { return }
-        polygonVertices.append(dataPoint(for: clamp(location, to: plotRect), in: plotRect))
+        let clamped = clamp(location, to: plotRect)
+        polygonVertices.append(dataPoint(for: clamped, in: plotRect))
+        polygonPreview = clamped
     }
 
     private func handleDoubleClick(_ location: CGPoint, plotRect: CGRect) {
@@ -171,6 +181,7 @@ struct ScatterPlotView: View {
                 onGate(PolygonGate(name: "Custom", vertices: polygonVertices))
             }
             polygonVertices.removeAll()
+            polygonPreview = nil
             return
         }
 
@@ -182,6 +193,7 @@ struct ScatterPlotView: View {
         if clickCount >= 2 {
             dragStart = nil
             dragCurrent = nil
+            polygonPreview = nil
             editState = nil
             handleDoubleClick(location, plotRect: plotRect)
             return
@@ -212,6 +224,14 @@ struct ScatterPlotView: View {
         }
         guard gateTool != .polygon, gateTool != .xCutoff, gateTool != .quadrant, dragStart != nil else { return }
         dragCurrent = clamp(location, to: plotRect)
+    }
+
+    private func handleMouseMoved(_ location: CGPoint, plotRect: CGRect) {
+        guard gateTool == .polygon, !polygonVertices.isEmpty else {
+            polygonPreview = nil
+            return
+        }
+        polygonPreview = clamp(location, to: plotRect)
     }
 
     private func handleMouseUp(_ location: CGPoint, plotRect: CGRect) {
@@ -386,6 +406,12 @@ struct ScatterPlotView: View {
                 path.addLine(to: point)
             }
             context.fill(Path(ellipseIn: CGRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6)), with: .color(.black))
+        }
+        if let polygonPreview, let lastVertex = polygonVertices.last {
+            path.move(to: viewPoint(for: lastVertex, in: plotRect))
+            path.addLine(to: polygonPreview)
+            context.fill(Path(ellipseIn: CGRect(x: polygonPreview.x - 3, y: polygonPreview.y - 3, width: 6, height: 6)), with: .color(.white))
+            context.stroke(Path(ellipseIn: CGRect(x: polygonPreview.x - 3, y: polygonPreview.y - 3, width: 6, height: 6)), with: .color(.black), lineWidth: 1)
         }
         context.stroke(path, with: .color(.black), lineWidth: 1.5)
     }
