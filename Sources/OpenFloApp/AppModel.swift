@@ -42,6 +42,7 @@ enum PlotMode: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 final class AppModel: ObservableObject {
     private static var childWindowControllers: [NSWindowController] = []
+    private static var axisWindowControllers: [NSWindowController] = []
 
     @Published private(set) var table: EventTable
     @Published private(set) var populationTitle: String
@@ -58,6 +59,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var activeGate: PolygonGate?
     @Published private(set) var gateMask: EventMask?
     @Published var gateLabelPosition: PlotPoint?
+    @Published private var axisSettingsByChannelName: [String: AxisDisplaySettings] = [:]
 
     private var baseMask: EventMask?
     private let renderQueue = DispatchQueue(label: "OpenFlo.render", qos: .userInitiated)
@@ -67,13 +69,15 @@ final class AppModel: ObservableObject {
     private var pendingGateEvaluation: PolygonGate?
 
     init(
-        table: EventTable = EventTable.synthetic(events: 750_000),
+        table: EventTable,
         baseMask: EventMask? = nil,
         populationTitle: String = "All Events",
         xChannel: Int? = nil,
         yChannel: Int? = nil,
         xTransform: TransformKind = .linear,
-        yTransform: TransformKind = .linear
+        yTransform: TransformKind = .linear,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil
     ) {
         self.table = table
         self.baseMask = baseMask
@@ -88,13 +92,26 @@ final class AppModel: ObservableObject {
             self.xChannel = axes.x
             self.yChannel = axes.y
         }
+        if let xAxisSettings {
+            saveAxisSettings(xAxisSettings, forChannel: self.xChannel)
+            self.xTransform = xAxisSettings.transform
+        }
+        if let yAxisSettings {
+            saveAxisSettings(yAxisSettings, forChannel: self.yChannel)
+            self.yTransform = yAxisSettings.transform
+        }
         if xTransform == .linear {
             self.xTransform = Self.defaultTransform(for: table.channels[self.xChannel])
+        } else {
+            self.xTransform = xTransform
         }
         if yTransform == .linear {
             self.yTransform = Self.defaultTransform(for: table.channels[self.yChannel])
+        } else {
+            self.yTransform = yTransform
         }
-        recomputePlot(reason: baseMask == nil ? "Synthetic data loaded" : "Population loaded")
+        syncCurrentTransformsFromSettings()
+        recomputePlot(reason: baseMask == nil ? "Plot loaded" : "Population loaded")
     }
 
     var channels: [Channel] {
@@ -128,6 +145,114 @@ final class AppModel: ObservableObject {
         channels[yChannel].name
     }
 
+    func axisSettings(for axis: PlotAxis) -> AxisDisplaySettings {
+        axisSettings(forChannel: channelIndex(for: axis))
+    }
+
+    func axisRange(for axis: PlotAxis) -> ClosedRange<Float> {
+        switch axis {
+        case .x:
+            return xRange
+        case .y:
+            return plotMode == .histogram ? xRange : yRange
+        }
+    }
+
+    func channelIndex(for axis: PlotAxis) -> Int {
+        switch axis {
+        case .x:
+            return xChannel
+        case .y:
+            return plotMode == .histogram ? xChannel : yChannel
+        }
+    }
+
+    func setAxisTransform(_ transform: TransformKind, for axis: PlotAxis) {
+        let channelIndex = channelIndex(for: axis)
+        var settings = axisSettings(forChannel: channelIndex)
+        settings.transform = transform
+        settings.minimum = nil
+        settings.maximum = nil
+        saveAxisSettings(settings, forChannel: channelIndex)
+        syncCurrentTransformsFromSettings()
+        clearGate(recompute: false)
+        recomputePlot(reason: "\(axis.title) set to \(transform.displayName)")
+    }
+
+    func resetAxis(_ axis: PlotAxis) {
+        let channelName = channels[channelIndex(for: axis)].name
+        axisSettingsByChannelName[channelName] = nil
+        syncCurrentTransformsFromSettings()
+        clearGate(recompute: false)
+        recomputePlot(reason: "\(axis.title) reset")
+    }
+
+    func applyAxisSettings(_ settings: AxisDisplaySettings, toChannelIndices channelIndices: Set<Int>) {
+        guard !channelIndices.isEmpty else { return }
+        for index in channelIndices where channels.indices.contains(index) {
+            saveAxisSettings(settings, forChannel: index)
+        }
+        syncCurrentTransformsFromSettings()
+        clearGate(recompute: false)
+        recomputePlot(reason: "Axis settings applied")
+    }
+
+    func automaticRange(forChannel channelIndex: Int, settings: AxisDisplaySettings) -> ClosedRange<Float> {
+        guard channels.indices.contains(channelIndex) else { return 0...1 }
+        let values = Self.applyTransform(settings, to: table.column(channelIndex))
+        return settings.resolvedRange(auto: EventTable.range(values: values, mask: baseMask))
+    }
+
+    func previewHistogram(
+        channelIndex: Int,
+        settings: AxisDisplaySettings,
+        range: ClosedRange<Float>,
+        binCount: Int = 220,
+        maxSamples: Int = 200_000
+    ) -> [UInt32] {
+        guard channels.indices.contains(channelIndex), binCount > 0 else { return [] }
+        let rawValues = table.column(channelIndex)
+        guard !rawValues.isEmpty else { return Array(repeating: 0, count: binCount) }
+        let selectedCount = baseMask?.selectedCount ?? rawValues.count
+        let sampleStride = max(1, selectedCount / max(1, maxSamples))
+        let span = range.upperBound - range.lowerBound
+        guard span.isFinite, span > 0 else { return Array(repeating: 0, count: binCount) }
+
+        var bins = Array(repeating: UInt32(0), count: binCount)
+        var selectedIndex = 0
+        for index in rawValues.indices {
+            if let baseMask {
+                guard baseMask.count == rawValues.count, baseMask[index] else { continue }
+            }
+            defer { selectedIndex += 1 }
+            guard selectedIndex % sampleStride == 0 else { continue }
+            let value = Self.applyTransform(settings, to: rawValues[index])
+            guard value.isFinite, value >= range.lowerBound, value <= range.upperBound else { continue }
+            let fraction = (value - range.lowerBound) / span
+            let bin = min(max(Int(fraction * Float(binCount)), 0), binCount - 1)
+            bins[bin] = bins[bin].addingReportingOverflow(1).partialValue
+        }
+        return bins
+    }
+
+    func openAxisCustomizationWindow(for axis: PlotAxis) {
+        let channel = channels[channelIndex(for: axis)]
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Transform of \(populationTitle): \(channel.displayName)"
+        window.center()
+        window.contentView = NSHostingView(
+            rootView: AxisTransformEditorView(model: self, axis: axis)
+        )
+        let controller = NSWindowController(window: window)
+        Self.axisWindowControllers.append(controller)
+        controller.showWindow(nil)
+    }
+
     func openFCSPanel() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
@@ -150,6 +275,7 @@ final class AppModel: ObservableObject {
                     self.table = file.table
                     self.baseMask = nil
                     self.populationTitle = "All Events"
+                    self.axisSettingsByChannelName = [:]
                     let axes = Self.defaultAxisSelection(for: file.table)
                     self.xChannel = axes.x
                     self.yChannel = axes.y
@@ -164,25 +290,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func loadSynthetic(events: Int) {
-        status = "Generating \(events.formatted()) synthetic events..."
-        renderQueue.async {
-            let table = EventTable.synthetic(events: events)
-            Task { @MainActor in
-                self.table = table
-                self.baseMask = nil
-                self.populationTitle = "All Events"
-                self.xChannel = 0
-                self.yChannel = 1
-                self.clearGate(recompute: false)
-                self.recomputePlot(reason: "Synthetic data loaded")
-            }
-        }
-    }
-
     func axesChanged(restoredGate: PolygonGate? = nil) {
-        xTransform = Self.defaultTransform(for: channels[xChannel])
-        yTransform = Self.defaultTransform(for: channels[yChannel])
+        syncCurrentTransformsFromSettings()
         pendingGateEvaluation = restoredGate
         clearGate(recompute: false)
         recomputePlot(reason: "Axes updated")
@@ -201,6 +310,7 @@ final class AppModel: ObservableObject {
     }
 
     func recomputePlot(reason: String = "Plot updated") {
+        syncCurrentTransformsFromSettings()
         let generation = renderGeneration + 1
         renderGeneration = generation
         status = "Rendering..."
@@ -208,8 +318,8 @@ final class AppModel: ObservableObject {
         let table = self.table
         let xChannel = self.xChannel
         let yChannel = self.yChannel
-        let xTransform = self.xTransform
-        let yTransform = self.yTransform
+        let xSettings = axisSettings(forChannel: xChannel)
+        let ySettings = axisSettings(forChannel: yChannel)
         let plotMode = self.plotMode
         let baseMask: EventMask?
         let repairedPopulationMask: Bool
@@ -223,9 +333,9 @@ final class AppModel: ObservableObject {
         }
 
         renderQueue.async {
-            let xValues = xTransform.apply(to: table.column(xChannel))
-            let yValues = yTransform.apply(to: table.column(yChannel))
-            let resolvedXRange = EventTable.range(values: xValues, mask: baseMask)
+            let xValues = Self.applyTransform(xSettings, to: table.column(xChannel))
+            let yValues = Self.applyTransform(ySettings, to: table.column(yChannel))
+            let resolvedXRange = xSettings.resolvedRange(auto: EventTable.range(values: xValues, mask: baseMask))
             let resolvedYRange: ClosedRange<Float>
             let image: NSImage
             if plotMode == .histogram {
@@ -233,7 +343,7 @@ final class AppModel: ObservableObject {
                 resolvedYRange = Self.histogramYRange(maxBin: histogram.maxBin)
                 image = HistogramRenderer.image(from: histogram, yRange: resolvedYRange)
             } else {
-                resolvedYRange = EventTable.range(values: yValues, mask: baseMask)
+                resolvedYRange = ySettings.resolvedRange(auto: EventTable.range(values: yValues, mask: baseMask))
                 let histogram = Histogram2D.build(
                     xValues: xValues,
                     yValues: yValues,
@@ -274,6 +384,8 @@ final class AppModel: ObservableObject {
         preferredYChannelName: String? = nil,
         preferredXTransform: TransformKind? = nil,
         preferredYTransform: TransformKind? = nil,
+        preferredXAxisSettings: AxisDisplaySettings? = nil,
+        preferredYAxisSettings: AxisDisplaySettings? = nil,
         restoredGate: PolygonGate? = nil
     ) {
         self.table = table
@@ -292,8 +404,18 @@ final class AppModel: ObservableObject {
         } else if yChannel >= table.channelCount || yChannel == xChannel {
             yChannel = Self.defaultAxisSelection(for: table).y
         }
-        xTransform = preferredXTransform ?? Self.defaultTransform(for: table.channels[xChannel])
-        yTransform = preferredYTransform ?? Self.defaultTransform(for: table.channels[yChannel])
+        if let preferredXAxisSettings {
+            saveAxisSettings(preferredXAxisSettings, forChannel: xChannel)
+        } else if let preferredXTransform {
+            saveAxisSettings(AxisDisplaySettings(transform: preferredXTransform), forChannel: xChannel)
+        }
+        if let preferredYAxisSettings {
+            saveAxisSettings(preferredYAxisSettings, forChannel: yChannel)
+        } else if let preferredYTransform {
+            saveAxisSettings(AxisDisplaySettings(transform: preferredYTransform), forChannel: yChannel)
+        }
+        xTransform = preferredXAxisSettings?.transform ?? preferredXTransform ?? axisSettings(forChannel: xChannel).transform
+        yTransform = preferredYAxisSettings?.transform ?? preferredYTransform ?? axisSettings(forChannel: yChannel).transform
         clearGate(recompute: false)
         recomputePlot(reason: "Population selected")
     }
@@ -356,7 +478,9 @@ final class AppModel: ObservableObject {
             xChannel: xChannel,
             yChannel: yChannel,
             xTransform: xTransform,
-            yTransform: yTransform
+            yTransform: yTransform,
+            xAxisSettings: axisSettings(for: .x),
+            yAxisSettings: axisSettings(for: .y)
         )
 
         let window = NSWindow(
@@ -390,6 +514,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func axisSettings(forChannel channelIndex: Int) -> AxisDisplaySettings {
+        guard channels.indices.contains(channelIndex) else {
+            return AxisDisplaySettings(transform: .linear)
+        }
+        let channel = channels[channelIndex]
+        return axisSettingsByChannelName[channel.name] ?? AxisDisplaySettings(transform: Self.defaultTransform(for: channel))
+    }
+
+    private func saveAxisSettings(_ settings: AxisDisplaySettings, forChannel channelIndex: Int) {
+        guard channels.indices.contains(channelIndex) else { return }
+        axisSettingsByChannelName[channels[channelIndex].name] = settings
+    }
+
+    private func syncCurrentTransformsFromSettings() {
+        if channels.indices.contains(xChannel) {
+            xTransform = axisSettings(forChannel: xChannel).transform
+        }
+        if channels.indices.contains(yChannel) {
+            yTransform = axisSettings(forChannel: yChannel).transform
+        }
+    }
+
+    private nonisolated static func applyTransform(_ settings: AxisDisplaySettings, to values: [Float]) -> [Float] {
+        settings.transform.apply(
+            to: values,
+            cofactor: pow(Float(10), settings.widthBasis),
+            extraNegativeDecades: settings.extraNegativeDecades,
+            widthBasis: settings.widthBasis,
+            positiveDecades: settings.positiveDecades
+        )
+    }
+
+    private nonisolated static func applyTransform(_ settings: AxisDisplaySettings, to value: Float) -> Float {
+        settings.transform.apply(
+            value,
+            cofactor: pow(Float(10), settings.widthBasis),
+            extraNegativeDecades: settings.extraNegativeDecades,
+            widthBasis: settings.widthBasis,
+            positiveDecades: settings.positiveDecades
+        )
+    }
+
     static func defaultAxisSelection(for table: EventTable) -> (x: Int, y: Int) {
         let names = table.channels.map { $0.name.uppercased() }
 
@@ -413,7 +579,7 @@ final class AppModel: ObservableObject {
         if name.contains("FSC") || name.contains("SSC") || channel.name.uppercased() == "TIME" {
             return .linear
         }
-        return .pseudoLog
+        return .logicle
     }
 
     private static func firstIndex(in names: [String], exactly target: String, excluding excluded: Int? = nil) -> Int? {

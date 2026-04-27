@@ -28,6 +28,16 @@ struct WorkspaceRow: Identifiable, Equatable {
     let isSynced: Bool
 }
 
+struct WorkspaceLayout: Identifiable, Equatable {
+    let id: UUID
+    var name: String
+
+    init(id: UUID = UUID(), name: String) {
+        self.id = id
+        self.name = name
+    }
+}
+
 final class WorkspaceGateNode: Identifiable, ObservableObject {
     let id: UUID
     var name: String
@@ -36,6 +46,8 @@ final class WorkspaceGateNode: Identifiable, ObservableObject {
     var yChannelName: String
     var xTransform: TransformKind
     var yTransform: TransformKind
+    var xAxisSettings: AxisDisplaySettings
+    var yAxisSettings: AxisDisplaySettings
     @Published var count: Int?
     @Published var children: [WorkspaceGateNode]
 
@@ -47,6 +59,8 @@ final class WorkspaceGateNode: Identifiable, ObservableObject {
         yChannelName: String,
         xTransform: TransformKind,
         yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil,
         count: Int? = nil,
         children: [WorkspaceGateNode] = []
     ) {
@@ -57,6 +71,8 @@ final class WorkspaceGateNode: Identifiable, ObservableObject {
         self.yChannelName = yChannelName
         self.xTransform = xTransform
         self.yTransform = yTransform
+        self.xAxisSettings = xAxisSettings ?? AxisDisplaySettings(transform: xTransform)
+        self.yAxisSettings = yAxisSettings ?? AxisDisplaySettings(transform: yTransform)
         self.count = count
         self.children = children
     }
@@ -69,6 +85,8 @@ final class WorkspaceGateNode: Identifiable, ObservableObject {
             yChannelName: yChannelName,
             xTransform: xTransform,
             yTransform: yTransform,
+            xAxisSettings: xAxisSettings,
+            yAxisSettings: yAxisSettings,
             count: nil,
             children: children.map { $0.clone() }
         )
@@ -96,10 +114,13 @@ final class WorkspaceModel: ObservableObject {
     @Published var groupGates: [WorkspaceGateNode] = []
     @Published var samples: [WorkspaceSample] = []
     @Published var selected: WorkspaceSelection?
+    @Published var layouts: [WorkspaceLayout] = [WorkspaceLayout(name: "Layout")]
+    @Published var selectedLayoutID: UUID?
     @Published private(set) var status: String = "Drop .fcs files here or add samples."
     @Published private(set) var gateChangeVersion = 0
     private var lastCreatedGate: WorkspaceSelection?
     private var plotWindowControllers: [NSWindowController] = []
+    private var layoutWindowControllers: [NSWindowController] = []
 
     var rows: [WorkspaceRow] {
         samples.flatMap { sample in
@@ -127,7 +148,9 @@ final class WorkspaceModel: ObservableObject {
         return output
     }
 
-    init() {}
+    init() {
+        selectedLayoutID = layouts.first?.id
+    }
 
     func selectedPopulation(for selection: WorkspaceSelection? = nil) -> (table: EventTable, mask: EventMask?, title: String)? {
         let resolved = selection ?? selected
@@ -182,22 +205,72 @@ final class WorkspaceModel: ObservableObject {
         addFCSURLs(panel.urls)
     }
 
-    func addSynthetic(events: Int) {
-        status = "Generating \(events.formatted()) synthetic events..."
-        DispatchQueue.global(qos: .userInitiated).async {
-            let table = EventTable.synthetic(events: events)
-            Task { @MainActor in
-                let sample = WorkspaceSample(name: "Synthetic \(events.formatted())", url: nil, table: table)
-                self.samples.append(sample)
-                if !self.groupGates.isEmpty {
-                    self.applyGroupTemplatesToSamples()
-                }
-                if self.selected == nil {
-                    self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
-                }
-                self.status = "Added synthetic sample."
-            }
+    func newWorkspace() {
+        groupGates.removeAll()
+        samples.removeAll()
+        selected = nil
+        layouts = [WorkspaceLayout(name: "Layout")]
+        selectedLayoutID = layouts.first?.id
+        lastCreatedGate = nil
+        gateChangeVersion += 1
+        status = "Started a new workspace."
+    }
+
+    func createGroup() {
+        status = "All Samples is ready for group gate templates."
+    }
+
+    func openTableEditor() {
+        let alert = NSAlert()
+        alert.messageText = "Table Editor"
+        alert.informativeText = "The workspace table is already editable for names, gates, counts, and drag-to-apply gate templates."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    func openPreferences() {
+        let alert = NSAlert()
+        alert.messageText = "Preferences"
+        alert.informativeText = "Preferences will appear here as OpenFlo grows."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    func addLayout() {
+        let nextNumber = layouts.count + 1
+        let layout = WorkspaceLayout(name: "Layout \(nextNumber)")
+        layouts.append(layout)
+        selectedLayoutID = layout.id
+        status = "Added \(layout.name)."
+    }
+
+    func deleteSelectedLayout() {
+        guard layouts.count > 1 else {
+            status = "Keep at least one layout."
+            return
         }
+        let deleteID = selectedLayoutID ?? layouts.last?.id
+        guard let deleteID, let index = layouts.firstIndex(where: { $0.id == deleteID }) else { return }
+        let deletedName = layouts[index].name
+        layouts.remove(at: index)
+        selectedLayoutID = layouts[min(index, layouts.count - 1)].id
+        status = "Deleted \(deletedName)."
+    }
+
+    func openLayoutEditor() {
+        let root = LayoutEditorView(workspace: self)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "OpenFlo Layouts"
+        window.center()
+        window.contentView = NSHostingView(rootView: root)
+        let controller = NSWindowController(window: window)
+        layoutWindowControllers.append(controller)
+        controller.showWindow(nil)
     }
 
     func addGateFromPlot(
@@ -206,18 +279,32 @@ final class WorkspaceModel: ObservableObject {
         yChannelName: String,
         xTransform: TransformKind,
         yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil,
         parentSelection: WorkspaceSelection? = nil
     ) -> WorkspaceSelection? {
         let target = parentSelection ?? selected
         guard let target, let sample = sample(id: target.sampleID) else { return nil }
         let parentMask = parentMask(for: target, in: sample)
-        let count = evaluate(gate: gate, sample: sample, base: parentMask, xChannelName: xChannelName, yChannelName: yChannelName, xTransform: xTransform, yTransform: yTransform).selectedCount
+        let resolvedXSettings = xAxisSettings ?? AxisDisplaySettings(transform: xTransform)
+        let resolvedYSettings = yAxisSettings ?? AxisDisplaySettings(transform: yTransform)
+        let count = evaluate(
+            gate: gate,
+            sample: sample,
+            base: parentMask,
+            xChannelName: xChannelName,
+            yChannelName: yChannelName,
+            xAxisSettings: resolvedXSettings,
+            yAxisSettings: resolvedYSettings
+        ).selectedCount
         return insertGate(
             gate,
             xChannelName: xChannelName,
             yChannelName: yChannelName,
             xTransform: xTransform,
             yTransform: yTransform,
+            xAxisSettings: resolvedXSettings,
+            yAxisSettings: resolvedYSettings,
             count: count,
             parentSelection: target,
             sample: sample
@@ -230,6 +317,8 @@ final class WorkspaceModel: ObservableObject {
         yChannelName: String,
         xTransform: TransformKind,
         yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings,
+        yAxisSettings: AxisDisplaySettings,
         count: Int,
         parentSelection target: WorkspaceSelection,
         sample: WorkspaceSample
@@ -242,6 +331,8 @@ final class WorkspaceModel: ObservableObject {
             yChannelName: yChannelName,
             xTransform: xTransform,
             yTransform: yTransform,
+            xAxisSettings: xAxisSettings,
+            yAxisSettings: yAxisSettings,
             count: count
         )
 
@@ -318,6 +409,8 @@ final class WorkspaceModel: ObservableObject {
                 yChannelName: node.yChannelName,
                 xTransform: node.xTransform,
                 yTransform: node.yTransform,
+                xAxisSettings: node.xAxisSettings,
+                yAxisSettings: node.yAxisSettings,
                 parentSelection: parentSelection
             ) else {
                 continue
@@ -404,7 +497,9 @@ final class WorkspaceModel: ObservableObject {
             xChannel: xIndex,
             yChannel: yIndex,
             xTransform: config?.xTransform ?? AppModel.defaultTransform(for: sample.table.channels[xIndex]),
-            yTransform: config?.yTransform ?? AppModel.defaultTransform(for: sample.table.channels[yIndex])
+            yTransform: config?.yTransform ?? AppModel.defaultTransform(for: sample.table.channels[yIndex]),
+            xAxisSettings: config?.xAxisSettings,
+            yAxisSettings: config?.yAxisSettings
         )
         let root = PlotWindowView(workspace: self, selection: selection, model: model)
         let window = NSWindow(
@@ -452,15 +547,22 @@ final class WorkspaceModel: ObservableObject {
         return WorkspaceSelection(sampleID: targetSample.id, gateID: matchedGate?.id)
     }
 
-    func gateConfiguration(for selection: WorkspaceSelection) -> (xChannelName: String, yChannelName: String, xTransform: TransformKind, yTransform: TransformKind)? {
+    func gateConfiguration(for selection: WorkspaceSelection) -> (
+        xChannelName: String,
+        yChannelName: String,
+        xTransform: TransformKind,
+        yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings,
+        yAxisSettings: AxisDisplaySettings
+    )? {
         if selection.isAllSamples {
             guard let gateID = selection.gateID, let node = gate(id: gateID, in: groupGates) else { return nil }
-            return (node.xChannelName, node.yChannelName, node.xTransform, node.yTransform)
+            return (node.xChannelName, node.yChannelName, node.xTransform, node.yTransform, node.xAxisSettings, node.yAxisSettings)
         }
         guard let gateID = selection.gateID, let sample = sample(id: selection.sampleID), let node = gate(id: gateID, in: sample.gates) else {
             return nil
         }
-        return (node.xChannelName, node.yChannelName, node.xTransform, node.yTransform)
+        return (node.xChannelName, node.yChannelName, node.xTransform, node.yTransform, node.xAxisSettings, node.yAxisSettings)
     }
 
     func gateDefinition(for selection: WorkspaceSelection) -> PolygonGate? {
@@ -490,7 +592,9 @@ final class WorkspaceModel: ObservableObject {
         xChannelName: String,
         yChannelName: String,
         xTransform: TransformKind,
-        yTransform: TransformKind
+        yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil
     ) -> (selection: WorkspaceSelection, gate: PolygonGate)? {
         guard !parentSelection.isAllSamples else { return nil }
         guard let sample = sample(id: parentSelection.sampleID) else { return nil }
@@ -503,7 +607,9 @@ final class WorkspaceModel: ObservableObject {
                xChannelName: xChannelName,
                yChannelName: yChannelName,
                xTransform: xTransform,
-               yTransform: yTransform
+               yTransform: yTransform,
+               xAxisSettings: xAxisSettings,
+               yAxisSettings: yAxisSettings
            ) {
             return (preferredSelection, preferredGate.gate)
         }
@@ -520,7 +626,9 @@ final class WorkspaceModel: ObservableObject {
                 xChannelName: xChannelName,
                 yChannelName: yChannelName,
                 xTransform: xTransform,
-                yTransform: yTransform
+                yTransform: yTransform,
+                xAxisSettings: xAxisSettings,
+                yAxisSettings: yAxisSettings
             )
         }) else {
             return nil
@@ -533,7 +641,9 @@ final class WorkspaceModel: ObservableObject {
         xChannelName: String,
         yChannelName: String,
         xTransform: TransformKind,
-        yTransform: TransformKind
+        yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil
     ) -> [(selection: WorkspaceSelection, gate: PolygonGate)] {
         guard !parentSelection.isAllSamples else { return [] }
         guard let sample = sample(id: parentSelection.sampleID) else { return [] }
@@ -549,7 +659,9 @@ final class WorkspaceModel: ObservableObject {
                 xChannelName: xChannelName,
                 yChannelName: yChannelName,
                 xTransform: xTransform,
-                yTransform: yTransform
+                yTransform: yTransform,
+                xAxisSettings: xAxisSettings,
+                yAxisSettings: yAxisSettings
             ) else {
                 return nil
             }
@@ -610,7 +722,9 @@ final class WorkspaceModel: ObservableObject {
         xChannelName: String,
         yChannelName: String,
         xTransform: TransformKind,
-        yTransform: TransformKind
+        yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil
     ) {
         guard !selection.isAllSamples else { return }
         guard let sample = sample(id: selection.sampleID), let gateID = selection.gateID, let node = gate(id: gateID, in: sample.gates) else { return }
@@ -620,6 +734,8 @@ final class WorkspaceModel: ObservableObject {
         node.yChannelName = yChannelName
         node.xTransform = xTransform
         node.yTransform = yTransform
+        node.xAxisSettings = xAxisSettings ?? AxisDisplaySettings(transform: xTransform)
+        node.yAxisSettings = yAxisSettings ?? AxisDisplaySettings(transform: yTransform)
         gateChangeVersion += 1
     }
 
@@ -759,6 +875,8 @@ final class WorkspaceModel: ObservableObject {
             yChannelName: source.yChannelName,
             xTransform: source.xTransform,
             yTransform: source.yTransform,
+            xAxisSettings: source.xAxisSettings,
+            yAxisSettings: source.yAxisSettings,
             count: count
         )
     }
@@ -769,6 +887,8 @@ final class WorkspaceModel: ObservableObject {
         node.yChannelName = source.yChannelName
         node.xTransform = source.xTransform
         node.yTransform = source.yTransform
+        node.xAxisSettings = source.xAxisSettings
+        node.yAxisSettings = source.yAxisSettings
         node.count = nil
     }
 
@@ -851,6 +971,8 @@ final class WorkspaceModel: ObservableObject {
             yChannelName: node.yChannelName,
             xTransform: node.xTransform,
             yTransform: node.yTransform,
+            xAxisSettings: node.xAxisSettings,
+            yAxisSettings: node.yAxisSettings,
             count: nil,
             children: children
         )
@@ -892,8 +1014,8 @@ final class WorkspaceModel: ObservableObject {
                 base: mask,
                 xChannelName: node.xChannelName,
                 yChannelName: node.yChannelName,
-                xTransform: node.xTransform,
-                yTransform: node.yTransform
+                xAxisSettings: node.xAxisSettings,
+                yAxisSettings: node.yAxisSettings
             )
         }
         return mask ?? EventMask(count: sample.table.rowCount, fill: true)
@@ -911,14 +1033,24 @@ final class WorkspaceModel: ObservableObject {
         base: EventMask?,
         xChannelName: String,
         yChannelName: String,
-        xTransform: TransformKind,
-        yTransform: TransformKind
+        xAxisSettings: AxisDisplaySettings,
+        yAxisSettings: AxisDisplaySettings
     ) -> EventMask {
         let xIndex = channelIndex(named: xChannelName, in: sample.table) ?? AppModel.defaultAxisSelection(for: sample.table).x
         let yIndex = channelIndex(named: yChannelName, in: sample.table) ?? AppModel.defaultAxisSelection(for: sample.table).y
-        let xValues = xTransform.apply(to: sample.table.column(xIndex))
-        let yValues = yTransform.apply(to: sample.table.column(yIndex))
+        let xValues = Self.applyTransform(xAxisSettings, to: sample.table.column(xIndex))
+        let yValues = Self.applyTransform(yAxisSettings, to: sample.table.column(yIndex))
         return gate.evaluate(xValues: xValues, yValues: yValues, base: base)
+    }
+
+    private nonisolated static func applyTransform(_ settings: AxisDisplaySettings, to values: [Float]) -> [Float] {
+        settings.transform.apply(
+            to: values,
+            cofactor: pow(Float(10), settings.widthBasis),
+            extraNegativeDecades: settings.extraNegativeDecades,
+            widthBasis: settings.widthBasis,
+            positiveDecades: settings.positiveDecades
+        )
     }
 
     private func refreshCount(for node: WorkspaceGateNode, in sample: WorkspaceSample) {
@@ -963,6 +1095,8 @@ final class WorkspaceModel: ObservableObject {
             && channelNamesMatch(lhs.yChannelName, rhs.yChannelName)
             && lhs.xTransform == rhs.xTransform
             && lhs.yTransform == rhs.yTransform
+            && lhs.xAxisSettings.matchesTransformParameters(rhs.xAxisSettings)
+            && lhs.yAxisSettings.matchesTransformParameters(rhs.yAxisSettings)
     }
 
     private func gateMatchesAxes(
@@ -970,12 +1104,18 @@ final class WorkspaceModel: ObservableObject {
         xChannelName: String,
         yChannelName: String,
         xTransform: TransformKind,
-        yTransform: TransformKind
+        yTransform: TransformKind,
+        xAxisSettings: AxisDisplaySettings? = nil,
+        yAxisSettings: AxisDisplaySettings? = nil
     ) -> Bool {
-        channelNamesMatch(node.xChannelName, xChannelName)
+        let resolvedXSettings = xAxisSettings ?? AxisDisplaySettings(transform: xTransform)
+        let resolvedYSettings = yAxisSettings ?? AxisDisplaySettings(transform: yTransform)
+        return channelNamesMatch(node.xChannelName, xChannelName)
             && channelNamesMatch(node.yChannelName, yChannelName)
             && node.xTransform == xTransform
             && node.yTransform == yTransform
+            && node.xAxisSettings.matchesTransformParameters(resolvedXSettings)
+            && node.yAxisSettings.matchesTransformParameters(resolvedYSettings)
     }
 
     private func channelIndex(named name: String, in table: EventTable) -> Int? {

@@ -25,6 +25,7 @@ struct PlotWindowView: View {
                 yRange: model.yRange,
                 gates: visibleGateOverlays,
                 selectedGateID: isActiveGateSelected ? activeGateID : nil,
+                labeledGateID: activeGateID,
                 gateTool: model.gateTool,
                 plotMode: model.plotMode,
                 xTransform: model.xTransform,
@@ -63,6 +64,15 @@ struct PlotWindowView: View {
                     guard let match = visibleGateMatches.first(where: { rowID(for: $0.selection) == gateID }),
                           match.gate.contains(x: point.x, y: point.y) else { return }
                     workspace.openPlotWindow(for: match.selection)
+                },
+                onAxisTransformChange: { axis, transform in
+                    model.setAxisTransform(transform, for: axis)
+                },
+                onAxisReset: { axis in
+                    model.resetAxis(axis)
+                },
+                onAxisCustomize: { axis in
+                    model.openAxisCustomizationWindow(for: axis)
                 }
             )
             .background(Color.white)
@@ -152,7 +162,9 @@ struct PlotWindowView: View {
             xChannelName: model.currentXChannelName,
             yChannelName: model.currentYChannelName,
             xTransform: model.xTransform,
-            yTransform: model.yTransform
+            yTransform: model.yTransform,
+            xAxisSettings: model.axisSettings(for: .x),
+            yAxisSettings: model.axisSettings(for: .y)
         )
     }
 
@@ -184,6 +196,8 @@ struct PlotWindowView: View {
             yChannelName: model.currentYChannelName,
             xTransform: model.xTransform,
             yTransform: model.yTransform,
+            xAxisSettings: model.axisSettings(for: .x),
+            yAxisSettings: model.axisSettings(for: .y),
             parentSelection: selection
         )
         activeGateSelection = newSelection
@@ -203,7 +217,9 @@ struct PlotWindowView: View {
             xChannelName: model.currentXChannelName,
             yChannelName: model.currentYChannelName,
             xTransform: model.xTransform,
-            yTransform: model.yTransform
+            yTransform: model.yTransform,
+            xAxisSettings: model.axisSettings(for: .x),
+            yAxisSettings: model.axisSettings(for: .y)
         )
         model.updateActiveGate(gate, reevaluate: false)
     }
@@ -237,8 +253,8 @@ struct PlotWindowView: View {
     }
 
     private func axesChangedPreservingGate() {
-        let xTransform = AppModel.defaultTransform(for: model.channels[model.xChannel])
-        let yTransform = AppModel.defaultTransform(for: model.channels[model.yChannel])
+        let xTransform = model.axisSettings(for: .x).transform
+        let yTransform = model.axisSettings(for: .y).transform
         let match = gateForCurrentAxes(xTransform: xTransform, yTransform: yTransform)
         if let match {
             activeGateSelection = match.selection
@@ -259,13 +275,19 @@ struct PlotWindowView: View {
     }
 
     private func gateForCurrentAxes(xTransform: TransformKind, yTransform: TransformKind) -> (selection: WorkspaceSelection, gate: PolygonGate)? {
+        var xAxisSettings = model.axisSettings(for: .x)
+        var yAxisSettings = model.axisSettings(for: .y)
+        xAxisSettings.transform = xTransform
+        yAxisSettings.transform = yTransform
         return workspace.gateForAxes(
             parentSelection: selection,
             preferredSelection: activeGateSelection,
             xChannelName: model.currentXChannelName,
             yChannelName: model.currentYChannelName,
             xTransform: xTransform,
-            yTransform: yTransform
+            yTransform: yTransform,
+            xAxisSettings: xAxisSettings,
+            yAxisSettings: yAxisSettings
         )
     }
 
@@ -289,7 +311,9 @@ struct PlotWindowView: View {
                 preferredXChannelName: model.currentXChannelName,
                 preferredYChannelName: model.currentYChannelName,
                 preferredXTransform: model.xTransform,
-                preferredYTransform: model.yTransform
+                preferredYTransform: model.yTransform,
+                preferredXAxisSettings: model.axisSettings(for: .x),
+                preferredYAxisSettings: model.axisSettings(for: .y)
             )
             restoreGateForCurrentAxes()
             return
@@ -323,6 +347,8 @@ struct PlotWindowView: View {
             preferredYChannelName: model.currentYChannelName,
             preferredXTransform: model.xTransform,
             preferredYTransform: model.yTransform,
+            preferredXAxisSettings: model.axisSettings(for: .x),
+            preferredYAxisSettings: model.axisSettings(for: .y),
             restoredGate: match?.gate
         )
     }
@@ -362,6 +388,8 @@ struct PlotWindowView: View {
             preferredYChannelName: config?.yChannelName ?? model.currentYChannelName,
             preferredXTransform: config?.xTransform,
             preferredYTransform: config?.yTransform,
+            preferredXAxisSettings: config?.xAxisSettings,
+            preferredYAxisSettings: config?.yAxisSettings,
             restoredGate: previousGate
         )
     }
@@ -384,7 +412,9 @@ struct PlotWindowView: View {
             xChannelName: model.currentXChannelName,
             yChannelName: model.currentYChannelName,
             xTransform: model.xTransform,
-            yTransform: model.yTransform
+            yTransform: model.yTransform,
+            xAxisSettings: model.axisSettings(for: .x),
+            yAxisSettings: model.axisSettings(for: .y)
         )
         selection = target
         activeGateSelection = match?.selection
@@ -397,6 +427,8 @@ struct PlotWindowView: View {
             preferredYChannelName: model.currentYChannelName,
             preferredXTransform: model.xTransform,
             preferredYTransform: model.yTransform,
+            preferredXAxisSettings: model.axisSettings(for: .x),
+            preferredYAxisSettings: model.axisSettings(for: .y),
             restoredGate: restoredGate ?? match?.gate
         )
     }
@@ -469,6 +501,7 @@ struct StandalonePlotPaneView: View {
                 yRange: model.yRange,
                 gates: model.activeGate.map { [PlotGateOverlay(id: "active", gate: $0)] } ?? [],
                 selectedGateID: isGateSelected ? "active" : nil,
+                labeledGateID: model.activeGate == nil ? nil : "active",
                 gateTool: model.gateTool,
                 plotMode: model.plotMode,
                 xTransform: model.xTransform,
@@ -517,6 +550,15 @@ struct StandalonePlotPaneView: View {
                 },
                 onOpenGate: { _, point in
                     model.openGateWindowIfPointIsInside(point)
+                },
+                onAxisTransformChange: { axis, transform in
+                    model.setAxisTransform(transform, for: axis)
+                },
+                onAxisReset: { axis in
+                    model.resetAxis(axis)
+                },
+                onAxisCustomize: { axis in
+                    model.openAxisCustomizationWindow(for: axis)
                 }
             )
         }

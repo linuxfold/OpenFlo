@@ -45,48 +45,22 @@ struct ContentView: View {
 
     private var ribbon: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 18) {
+            HStack(alignment: .top, spacing: 10) {
                 Label("OpenFlo", systemImage: "triangle.lefthalf.filled")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.teal)
+                    .frame(width: 84, alignment: .leading)
+                    .padding(.top, 4)
 
                 Divider()
-                    .frame(height: 34)
+                    .frame(height: 156)
 
-                Button {
-                    workspace.openFCSPanel()
-                } label: {
-                    Label("Add Samples", systemImage: "plus.rectangle.on.folder")
-                }
+                navigateRibbonGroup
 
-                Menu {
-                    Button("750,000 events") { workspace.addSynthetic(events: 750_000) }
-                    Button("2,000,000 events") { workspace.addSynthetic(events: 2_000_000) }
-                    Button("5,000,000 events") { workspace.addSynthetic(events: 5_000_000) }
-                } label: {
-                    Label("Synthetic", systemImage: "waveform.path.ecg")
-                }
+                Divider()
+                    .frame(height: 156)
 
-                Button {
-                    beginRename()
-                } label: {
-                    Label("Rename", systemImage: "pencil")
-                }
-                .disabled(currentRow == nil)
-
-                Button(role: .destructive) {
-                    deleteSelected()
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                }
-                .disabled(currentRow == nil)
-                .keyboardShortcut(.delete, modifiers: [])
-
-                Button {
-                    workspace.applySelectedGateToAllSamples()
-                } label: {
-                    Label("Apply Gate to All", systemImage: "square.stack.3d.up")
-                }
+                editRibbonGroup
 
                 Spacer()
 
@@ -94,14 +68,86 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .padding(.top, 8)
             }
-            .buttonStyle(.bordered)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
 
             Divider()
         }
         .background(.regularMaterial)
+    }
+
+    private var navigateRibbonGroup: some View {
+        VStack(spacing: 4) {
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    WorkspaceRibbonButton(title: "New Workspace", systemImage: "doc.badge.plus") {
+                        OpenFloWindowManager.shared.openWorkspaceWindow()
+                    }
+
+                    WorkspaceRibbonButton(title: "Table Editor", systemImage: "tablecells") {
+                        workspace.openTableEditor()
+                    }
+                }
+
+                HStack(spacing: 0) {
+                    WorkspaceRibbonMenuButton(title: "Add Samples...", systemImage: "testtube.2") {
+                        Button("FCS Files...") {
+                            workspace.openFCSPanel()
+                        }
+                    }
+
+                    WorkspaceRibbonButton(title: "Layout Editor", systemImage: "ruler") {
+                        workspace.openLayoutEditor()
+                    }
+                }
+
+                HStack(spacing: 0) {
+                    WorkspaceRibbonButton(title: "Create Group...", systemImage: "curlybraces") {
+                        workspace.createGroup()
+                    }
+
+                    WorkspaceRibbonButton(title: "Preferences...", systemImage: "heart") {
+                        workspace.openPreferences()
+                    }
+                }
+            }
+
+            Text("Navigate")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+        }
+        .frame(width: 430)
+    }
+
+    private var editRibbonGroup: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 2) {
+                WorkspaceRibbonIconButton(title: "Rename", systemImage: "pencil") {
+                    beginRename()
+                }
+                .disabled(currentRow == nil)
+
+                WorkspaceRibbonIconButton(title: "Delete", systemImage: "trash") {
+                    deleteSelected()
+                }
+                .disabled(currentRow == nil)
+                .keyboardShortcut(.delete, modifiers: [])
+
+                WorkspaceRibbonIconButton(title: "Apply Gate to All", systemImage: "square.stack.3d.up") {
+                    workspace.applySelectedGateToAllSamples()
+                }
+            }
+
+            Text("Edit")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+        }
+        .frame(width: 140)
     }
 
     private var workspacePane: some View {
@@ -653,5 +699,119 @@ private struct WorkspaceRowView: View {
         .font(.callout)
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+    }
+}
+
+private struct WorkspaceRibbonButton: View {
+    let title: String
+    let systemImage: String
+    var width: CGFloat = 214
+    var height: CGFloat = 42
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            WorkspaceRibbonButtonLabel(
+                title: title,
+                systemImage: systemImage,
+                width: width,
+                height: height
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct WorkspaceRibbonMenuButton<Content: View>: View {
+    let title: String
+    let systemImage: String
+    var width: CGFloat = 214
+    var height: CGFloat = 42
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Menu {
+            content()
+        } label: {
+            WorkspaceRibbonButtonLabel(
+                title: title,
+                systemImage: systemImage,
+                showsMenuIndicator: true,
+                width: width,
+                height: height
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct WorkspaceRibbonIconButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(isEnabled ? Color.teal : Color.secondary)
+                .frame(width: 40, height: 42)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(isHovering && isEnabled ? Color.accentColor.opacity(0.12) : Color.clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+private struct WorkspaceRibbonButtonLabel: View {
+    let title: String
+    let systemImage: String
+    var showsMenuIndicator = false
+    let width: CGFloat
+    let height: CGFloat
+
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 21, weight: .medium))
+                .foregroundStyle(isEnabled ? Color.teal : Color.secondary)
+                .frame(width: 24)
+
+            Text(title)
+                .font(.callout)
+                .lineLimit(1)
+                .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
+
+            Spacer(minLength: 4)
+
+            if showsMenuIndicator {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(width: width, height: height, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(isHovering && isEnabled ? Color.accentColor.opacity(0.12) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovering = hovering
+        }
     }
 }

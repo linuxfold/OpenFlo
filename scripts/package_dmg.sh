@@ -7,7 +7,14 @@ STAGE_DIR="$DIST_DIR/dmg-root"
 APP_NAME="OpenFlo"
 APP_DIR="$STAGE_DIR/$APP_NAME.app"
 DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+RW_DMG_PATH="$DIST_DIR/$APP_NAME-rw.dmg"
+MOUNT_DIR="$DIST_DIR/dmg-mount"
 RESOURCE_DIR="$ROOT_DIR/Sources/OpenFloApp/Resources"
+DMG_BACKGROUND_SIZE=820
+DMG_WINDOW_LEFT=120
+DMG_WINDOW_TOP=48
+DMG_WINDOW_RIGHT=$((DMG_WINDOW_LEFT + DMG_BACKGROUND_SIZE))
+DMG_WINDOW_BOTTOM=$((DMG_WINDOW_TOP + DMG_BACKGROUND_SIZE))
 
 cd "$ROOT_DIR"
 swift build -c release
@@ -23,6 +30,7 @@ if [ -d "$RESOURCE_DIR" ]; then
 fi
 
 ICON_PNG="$RESOURCE_DIR/OpenFloClosed.png"
+OPEN_ICON_PNG="$RESOURCE_DIR/OpenFloOpen.png"
 ICONSET_DIR="$DIST_DIR/OpenFloClosed.iconset"
 if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 && [ -f "$ICON_PNG" ]; then
     mkdir -p "$ICONSET_DIR"
@@ -41,6 +49,15 @@ if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 && [ -
 1024 icon_512x512@2x.png
 SIZES
     iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/OpenFloClosed.icns"
+fi
+
+BACKGROUND_DIR="$STAGE_DIR/.background"
+BACKGROUND_PNG="$BACKGROUND_DIR/OpenFloDMGBackground.png"
+mkdir -p "$BACKGROUND_DIR"
+if command -v sips >/dev/null 2>&1 && [ -f "$OPEN_ICON_PNG" ]; then
+    sips -z "$DMG_BACKGROUND_SIZE" "$DMG_BACKGROUND_SIZE" "$OPEN_ICON_PNG" --out "$BACKGROUND_PNG" >/dev/null
+elif [ -f "$OPEN_ICON_PNG" ]; then
+    cp "$OPEN_ICON_PNG" "$BACKGROUND_PNG"
 fi
 
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
@@ -75,12 +92,58 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 PLIST
 
 ln -s /Applications "$STAGE_DIR/Applications"
-rm -f "$DMG_PATH"
+rm -f "$DMG_PATH" "$RW_DMG_PATH"
+rm -rf "$MOUNT_DIR"
 hdiutil create \
     -volname "$APP_NAME" \
     -srcfolder "$STAGE_DIR" \
     -ov \
+    -fs HFS+ \
+    -format UDRW \
+    "$RW_DMG_PATH"
+
+if command -v osascript >/dev/null 2>&1 && [ -f "$BACKGROUND_PNG" ]; then
+    mkdir -p "$MOUNT_DIR"
+    hdiutil attach "$RW_DMG_PATH" -readwrite -noverify -noautoopen -mountpoint "$MOUNT_DIR" >/dev/null
+    cleanup_mount() {
+        hdiutil detach "$MOUNT_DIR" -quiet >/dev/null 2>&1 || true
+    }
+    trap cleanup_mount EXIT
+
+    osascript <<APPLESCRIPT
+set dmgFolderAlias to POSIX file "$MOUNT_DIR" as alias
+set backgroundAlias to POSIX file "$MOUNT_DIR/.background/OpenFloDMGBackground.png" as alias
+tell application "Finder"
+    set dmgFolder to folder dmgFolderAlias
+    open dmgFolder
+    set dmgWindow to container window of dmgFolder
+    set current view of dmgWindow to icon view
+    set toolbar visible of dmgWindow to false
+    set statusbar visible of dmgWindow to false
+    set the bounds of dmgWindow to {$DMG_WINDOW_LEFT, $DMG_WINDOW_TOP, $DMG_WINDOW_RIGHT, $DMG_WINDOW_BOTTOM}
+    set viewOptions to the icon view options of dmgWindow
+    set arrangement of viewOptions to not arranged
+    set icon size of viewOptions to 96
+    set background picture of viewOptions to backgroundAlias
+    set position of item "$APP_NAME.app" of dmgFolder to {270, 448}
+    set position of item "Applications" of dmgFolder to {550, 448}
+    update dmgFolder without registering applications
+    delay 1
+    close dmgWindow
+end tell
+APPLESCRIPT
+
+    sync
+    cleanup_mount
+    trap - EXIT
+    rm -rf "$MOUNT_DIR"
+fi
+
+hdiutil convert "$RW_DMG_PATH" \
     -format UDZO \
-    "$DMG_PATH"
+    -imagekey zlib-level=9 \
+    -o "$DMG_PATH" \
+    -ov >/dev/null
+rm -f "$RW_DMG_PATH"
 
 echo "Created $DMG_PATH"

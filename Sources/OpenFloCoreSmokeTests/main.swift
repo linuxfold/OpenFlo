@@ -85,6 +85,22 @@ func testFCSFloatByteOrders() throws {
     expect(abs(big.table.value(event: 0, channel: 0) - 42.25) < 0.001, "4,3,2,1 should parse as big-endian")
 }
 
+func testFCSParserTrimsPaddedNumericKeywords() throws {
+    let file = try FCSParser.parse(
+        data: singleFloatFCS(
+            value: 17.5,
+            byteOrder: "4,3,2,1",
+            eventCountText: "1       ",
+            bitWidthText: " 32 ",
+            includeKeywordOffsets: true
+        )
+    )
+
+    expect(file.table.rowCount == 1, "padded $TOT should parse as the event count")
+    expect(file.table.channels[0].bitWidth == 32, "padded $P1B should parse as the bit width")
+    expect(abs(file.table.value(event: 0, channel: 0) - 17.5) < 0.001, "padded data offsets should still locate the event data")
+}
+
 func testFCSMarkerFluorochromeLabels() throws {
     let file = try FCSParser.parse(
         data: singleFloatFCS(
@@ -102,13 +118,42 @@ func testFCSMarkerFluorochromeLabels() throws {
     expect(channel.displayName == "CD86 (AF647)", "display name should combine marker and fluorochrome")
 }
 
-func singleFloatFCS(value: Float, byteOrder: String, parameterName: String = "FSC-A", parameterStain: String? = nil) -> Data {
+func singleFloatFCS(
+    value: Float,
+    byteOrder: String,
+    parameterName: String = "FSC-A",
+    parameterStain: String? = nil,
+    eventCountText: String = "1",
+    bitWidthText: String = "32",
+    includeKeywordOffsets: Bool = false
+) -> Data {
     let stainText = parameterStain.map { "/$P1S/\($0)" } ?? ""
-    let text = "/$TOT/1/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/\(parameterName)/$P1B/32/$P1R/262144\(stainText)/"
     let textStart = 58
+    var text = ""
+    var dataStart = 0
+    var dataEnd = 0
+
+    for _ in 0..<4 {
+        text = "/$TOT/\(eventCountText)/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/\(parameterName)/$P1B/\(bitWidthText)/$P1R/262144\(stainText)"
+        if includeKeywordOffsets {
+            text += "/$BEGINDATA/ \(dataStart) /$ENDDATA/\(dataEnd)      "
+        }
+        text += "/"
+
+        let nextDataStart = textStart + text.utf8.count
+        let nextDataEnd = nextDataStart + 3
+        if nextDataStart == dataStart, nextDataEnd == dataEnd {
+            break
+        }
+        dataStart = nextDataStart
+        dataEnd = nextDataEnd
+    }
+
     let textEnd = textStart + text.utf8.count - 1
-    let dataStart = textEnd + 1
-    let dataEnd = dataStart + 3
+    if !includeKeywordOffsets {
+        dataStart = textEnd + 1
+        dataEnd = dataStart + 3
+    }
 
     var data = Data("FCS3.1    ".utf8)
     data.append(fcsHeaderField(textStart))

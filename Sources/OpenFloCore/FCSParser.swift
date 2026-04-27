@@ -71,8 +71,8 @@ public enum FCSParser {
         let dataType = try required("$DATATYPE", keywords).uppercased()
         let byteOrder = keywords["$BYTEORD"] ?? "1,2,3,4"
         let littleEndian = try isLittleEndian(byteOrder)
-        let dataStart = Int(keywords["$BEGINDATA"] ?? "").flatMap { $0 > 0 ? $0 : nil } ?? dataStartHeader
-        let dataEnd = Int(keywords["$ENDDATA"] ?? "").flatMap { $0 > 0 ? $0 : nil } ?? dataEndHeader
+        let dataStart = optionalInt(keywords["$BEGINDATA"]).flatMap { $0 > 0 ? $0 : nil } ?? dataStartHeader
+        let dataEnd = optionalInt(keywords["$ENDDATA"]).flatMap { $0 > 0 ? $0 : nil } ?? dataEndHeader
         guard dataStart >= 0, dataEnd >= dataStart, dataEnd < data.count else {
             throw FCSParserError.invalidHeader
         }
@@ -81,7 +81,7 @@ public enum FCSParser {
             let name = keywords["$P\(index)N"] ?? "P\(index)"
             let marker = normalizedOptional(keywords["$P\(index)S"])
             let fluorochrome = fluorochromeName(from: name, markerName: marker)
-            let bitWidth = Int(keywords["$P\(index)B"] ?? "")
+            let bitWidth = optionalInt(keywords["$P\(index)B"])
             return Channel(name: name, bitWidth: bitWidth, markerName: marker, fluorochromeName: fluorochrome)
         }
 
@@ -94,7 +94,7 @@ public enum FCSParser {
             columns = try parseDoubles(segment: segment, eventCount: eventCount, parameterCount: parameterCount, littleEndian: littleEndian)
         case "I":
             let widths = try (1...parameterCount).map { index -> Int in
-                guard let width = Int(keywords["$P\(index)B"] ?? "") else {
+                guard let width = optionalInt(keywords["$P\(index)B"]) else {
                     throw FCSParserError.missingKeyword("$P\(index)B")
                 }
                 return width
@@ -226,10 +226,15 @@ public enum FCSParser {
     }
 
     private static func requiredInt(_ key: String, _ keywords: [String: String]) throws -> Int {
-        guard let value = Int(try required(key, keywords)) else {
+        guard let value = optionalInt(try required(key, keywords)) else {
             throw FCSParserError.missingKeyword(key)
         }
         return value
+    }
+
+    private static func optionalInt(_ value: String?) -> Int? {
+        guard let value else { return nil }
+        return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private static func normalizedOptional(_ value: String?) -> String? {

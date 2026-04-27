@@ -13,6 +13,7 @@ struct ScatterPlotView: View {
     let yRange: ClosedRange<Float>
     let gates: [PlotGateOverlay]
     let selectedGateID: String?
+    let labeledGateID: String?
     let gateTool: GateTool
     let plotMode: PlotMode
     let xTransform: TransformKind
@@ -33,12 +34,16 @@ struct ScatterPlotView: View {
     let onGateEditEnded: (PolygonGate) -> Void
     let onGateLabelMoved: (PlotPoint) -> Void
     let onOpenGate: (String, PlotPoint) -> Void
+    let onAxisTransformChange: (PlotAxis, TransformKind) -> Void
+    let onAxisReset: (PlotAxis) -> Void
+    let onAxisCustomize: (PlotAxis) -> Void
 
     @State private var dragStart: CGPoint?
     @State private var dragCurrent: CGPoint?
     @State private var polygonVertices: [PlotPoint] = []
     @State private var polygonPreview: CGPoint?
     @State private var editState: GateEditState?
+    private let vertexHitRadius: CGFloat = 20
 
     private enum GateEditState {
         case vertex(index: Int)
@@ -54,6 +59,11 @@ struct ScatterPlotView: View {
     private var selectedGate: PolygonGate? {
         guard let selectedGateID else { return nil }
         return gates.first { $0.id == selectedGateID }?.gate
+    }
+
+    private var labeledGate: PlotGateOverlay? {
+        guard let labeledGateID else { return nil }
+        return gates.first { $0.id == labeledGateID }
     }
 
     var body: some View {
@@ -78,7 +88,7 @@ struct ScatterPlotView: View {
                     drawAxes(context: context, plotRect: plotRect)
                 }
 
-                if isGateSelected, let gateLabelPosition, !gatePercentText.isEmpty {
+                if labeledGate != nil, let gateLabelPosition, !gatePercentText.isEmpty {
                     let center = labelCenter(for: gateLabelPosition, in: plotRect)
                     Text(gatePercentText)
                         .font(.caption.weight(.semibold))
@@ -106,14 +116,18 @@ struct ScatterPlotView: View {
                     }
                 )
 
-                axisMenu(
-                    label: channels[xChannel].displayName,
-                    selected: xChannel,
-                    includeHistogram: false,
-                    onSelect: onXChannelChange,
-                    onHistogram: {}
-                )
-                .position(x: plotRect.midX, y: min(geometry.size.height - 16, plotRect.maxY + 50))
+                HStack(spacing: 6) {
+                    axisMenu(
+                        label: channels[xChannel].displayName,
+                        selected: xChannel,
+                        includeHistogram: false,
+                        onSelect: onXChannelChange,
+                        onHistogram: {}
+                    )
+
+                    axisTransformButton(axis: .x, transform: xTransform)
+                }
+                .position(x: plotRect.midX + 22, y: min(geometry.size.height - 22, plotRect.maxY + 50))
 
                 axisMenu(
                     label: plotMode == .histogram ? "Histogram" : channels[yChannel].displayName,
@@ -126,6 +140,11 @@ struct ScatterPlotView: View {
                 )
                 .rotationEffect(.degrees(-90))
                 .position(x: max(18, plotRect.minX - 70), y: plotRect.midY)
+
+                if plotMode != .histogram {
+                    axisTransformButton(axis: .y, transform: yTransform)
+                        .position(x: max(18, plotRect.minX - 70), y: plotRect.midY - 78)
+                }
             }
             .clipShape(Rectangle())
             .contentShape(Rectangle())
@@ -297,9 +316,10 @@ struct ScatterPlotView: View {
 
         let point = dataPoint(for: clamp(location, to: plotRect), in: plotRect)
         let clickedLabel = labelFrame(in: plotRect)?.contains(location) == true
+        let selectedVertexHit = clickedLabel ? nil : selectedGateVertexHit(at: location, plotRect: plotRect)
         let hit = clickedLabel
-            ? selectedGateID.flatMap { selectedID in gates.first { $0.id == selectedID } }
-            : gateHit(at: point)
+            ? labeledGate
+            : selectedVertexHit?.overlay ?? gateHit(at: point)
         guard let hit else {
             editState = nil
             onGateDeselected()
@@ -315,6 +335,11 @@ struct ScatterPlotView: View {
         let gate = hit.gate
         if clickedLabel {
             editState = .label
+            return
+        }
+
+        if let selectedVertexHit, selectedVertexHit.overlay.id == hit.id {
+            editState = .vertex(index: selectedVertexHit.index)
             return
         }
 
@@ -447,12 +472,22 @@ struct ScatterPlotView: View {
         gates.reversed().first { $0.gate.contains(x: point.x, y: point.y) }
     }
 
+    private func selectedGateVertexHit(at location: CGPoint, plotRect: CGRect) -> (overlay: PlotGateOverlay, index: Int)? {
+        guard isGateSelected,
+              let selectedGateID,
+              let overlay = gates.first(where: { $0.id == selectedGateID }),
+              let index = nearestVertex(to: location, gate: overlay.gate, plotRect: plotRect) else {
+            return nil
+        }
+        return (overlay, index)
+    }
+
     private func nearestVertex(to location: CGPoint, gate: PolygonGate, plotRect: CGRect) -> Int? {
         var best: (index: Int, distance: CGFloat)?
         for (index, vertex) in gate.vertices.enumerated() {
             let point = viewPoint(for: vertex, in: plotRect)
             let distance = hypot(point.x - location.x, point.y - location.y)
-            if distance <= 12, best == nil || distance < best!.distance {
+            if distance <= vertexHitRadius, best == nil || distance < best!.distance {
                 best = (index, distance)
             }
         }
@@ -617,15 +652,18 @@ struct ScatterPlotView: View {
 
     private func ticks(for range: ClosedRange<Float>, transform: TransformKind, targetCount: Int) -> [AxisTick] {
         switch transform {
-        case .pseudoLog:
-            let pseudoLogTicks = pseudoLogAxisTicks(in: range, targetCount: targetCount)
+        case .logarithmic:
+            let logTicks = decadeAxisTicks(in: range, targetCount: targetCount, signed: false)
+            return logTicks.count >= 2 ? logTicks : linearTicks(in: range, targetCount: targetCount)
+        case .biexponential, .hyperlog, .logicle, .miltenyi, .pseudoLog:
+            let pseudoLogTicks = decadeAxisTicks(in: range, targetCount: targetCount, signed: true)
             return pseudoLogTicks.count >= 2 ? pseudoLogTicks : linearTicks(in: range, targetCount: targetCount)
         case .linear, .arcsinh:
             return linearTicks(in: range, targetCount: targetCount)
         }
     }
 
-    private func pseudoLogAxisTicks(in range: ClosedRange<Float>, targetCount: Int) -> [AxisTick] {
+    private func decadeAxisTicks(in range: ClosedRange<Float>, targetCount: Int, signed: Bool) -> [AxisTick] {
         guard range.lowerBound.isFinite, range.upperBound.isFinite, range.upperBound > range.lowerBound else {
             return []
         }
@@ -640,16 +678,23 @@ struct ScatterPlotView: View {
             guard power == 0 || abs(power) % stride == 0 else { return nil }
             let value = Float(power)
             guard value >= range.lowerBound, value <= range.upperBound else { return nil }
-            return AxisTick(value: value, label: pseudoLogLabel(forPower: power))
+            return AxisTick(value: value, label: signed ? signedDecadeLabel(forPower: power) : positiveDecadeLabel(forPower: power))
         }
     }
 
-    private func pseudoLogLabel(forPower power: Int) -> String {
+    private func signedDecadeLabel(forPower power: Int) -> String {
         if power == 0 {
             return "0"
         }
         if power < 0 {
             return "-10^\(abs(power))"
+        }
+        return "10^\(power)"
+    }
+
+    private func positiveDecadeLabel(forPower power: Int) -> String {
+        if power == 0 {
+            return "1"
         }
         return "10^\(power)"
     }
@@ -761,4 +806,49 @@ struct ScatterPlotView: View {
         .menuStyle(.borderlessButton)
         .fixedSize()
     }
+
+    private func axisTransformButton(axis: PlotAxis, transform: TransformKind) -> some View {
+        Menu {
+            Button {
+                onAxisTransformChange(axis, .linear)
+            } label: {
+                if transform == .linear {
+                    Label("Linear Axis", systemImage: "checkmark")
+                } else {
+                    Text("Linear Axis")
+                }
+            }
+
+            Button {
+                onAxisTransformChange(axis, .logarithmic)
+            } label: {
+                if transform == .logarithmic {
+                    Label("Log Axis", systemImage: "checkmark")
+                } else {
+                    Text("Log Axis")
+                }
+            }
+
+            Divider()
+
+            Button("Reset") {
+                onAxisReset(axis)
+            }
+
+            Button("Customize Axis...") {
+                onAxisCustomize(axis)
+            }
+        } label: {
+            Text("T")
+                .font(.system(size: 24, weight: .bold, design: .serif))
+                .foregroundStyle(.black)
+                .frame(width: 38, height: 38)
+                .background(Color(nsColor: .controlColor))
+                .overlay(Rectangle().stroke(.black.opacity(0.65), lineWidth: 1.4))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("\(axis.title) transform")
+    }
+
 }
