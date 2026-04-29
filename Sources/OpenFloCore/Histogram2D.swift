@@ -45,7 +45,8 @@ public struct Histogram2D: Equatable, Sendable {
             return Histogram2D(width: width, height: height, bins: Array(repeating: 0, count: binCount), xRange: resolvedXRange, yRange: resolvedYRange)
         }
 
-        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, eventCount))
+        let availableWorkers = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+        let workers = max(1, min(4, availableWorkers, eventCount))
         let group = DispatchGroup()
         let queue = DispatchQueue.global(qos: .userInitiated)
         final class PartialStore: @unchecked Sendable {

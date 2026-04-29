@@ -15,6 +15,9 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             ribbon
+            if let progress = workspace.progress {
+                WorkspaceProgressBanner(progress: progress)
+            }
             workspacePane
         }
         .frame(minWidth: 760, minHeight: 520)
@@ -83,12 +86,16 @@ struct ContentView: View {
         VStack(spacing: 4) {
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
-                    WorkspaceRibbonButton(title: "New Workspace", systemImage: "doc.badge.plus") {
+                    WorkspaceRibbonButton(title: "New", systemImage: "doc.badge.plus", width: 142) {
                         OpenFloWindowManager.shared.openWorkspaceWindow()
                     }
 
-                    WorkspaceRibbonButton(title: "Table Editor", systemImage: "tablecells") {
-                        workspace.openTableEditor()
+                    WorkspaceRibbonButton(title: "Open...", systemImage: "folder", width: 142) {
+                        workspace.openWorkspacePanel()
+                    }
+
+                    WorkspaceRibbonButton(title: "Save...", systemImage: "square.and.arrow.down", width: 142) {
+                        workspace.saveWorkspacePanel()
                     }
                 }
 
@@ -96,6 +103,16 @@ struct ContentView: View {
                     WorkspaceRibbonMenuButton(title: "Add Samples...", systemImage: "testtube.2") {
                         Button("FCS Files...") {
                             workspace.openFCSPanel()
+                        }
+                        Button("Single Cell Matrix...") {
+                            workspace.openSingleCellPanel()
+                        }
+                        Button("Seqtometry Signature...") {
+                            workspace.openSignaturePanel()
+                        }
+                        Divider()
+                        Button("PBMC3k Seqtometry Demo") {
+                            workspace.downloadSeqtometryDemo()
                         }
                     }
 
@@ -105,12 +122,12 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 0) {
-                    WorkspaceRibbonButton(title: "Create Group...", systemImage: "curlybraces") {
-                        workspace.createGroup()
+                    WorkspaceRibbonButton(title: "Table Editor", systemImage: "tablecells") {
+                        workspace.openTableEditor()
                     }
 
-                    WorkspaceRibbonButton(title: "Preferences...", systemImage: "heart") {
-                        workspace.openPreferences()
+                    WorkspaceRibbonButton(title: "Create Group...", systemImage: "curlybraces") {
+                        workspace.createGroup()
                     }
                 }
             }
@@ -205,7 +222,7 @@ struct ContentView: View {
                         Image(systemName: "tray.and.arrow.down")
                             .font(.largeTitle)
                             .foregroundStyle(.secondary)
-                        Text("Drop .fcs files here")
+                        Text("Drop .fcs or single-cell files here")
                             .font(.headline)
                         Text("or use Add Samples")
                             .font(.callout)
@@ -407,7 +424,7 @@ struct ContentView: View {
                 let url = droppedFileURL(from: item)
                 if let url {
                     Task { @MainActor in
-                        workspace.addFCSURLs([url])
+                        workspace.addDataURLs([url])
                     }
                 }
             }
@@ -512,11 +529,11 @@ struct ContentView: View {
     }
 
     private func selectedRowsForDrag(startingAt row: WorkspaceRow) -> [WorkspaceRow] {
-        let selectedRows = allRows.filter { selectedRowIDs.contains($0.id) && $0.isGate }
-        if row.isGate, selectedRowIDs.contains(row.id), !selectedRows.isEmpty {
+        let selectedRows = allRows.filter { selectedRowIDs.contains($0.id) && ($0.isGate || !$0.selection.isAllSamples) }
+        if selectedRowIDs.contains(row.id), !selectedRows.isEmpty {
             return selectedRows
         }
-        return row.isGate ? [row] : []
+        return row.isGate || !row.selection.isAllSamples ? [row] : []
     }
 
     private func handleGateDrop(_ providers: [NSItemProvider], target: WorkspaceSelection) -> Bool {
@@ -531,6 +548,55 @@ struct ContentView: View {
             }
         }
         return true
+    }
+}
+
+private struct WorkspaceProgressBanner: View {
+    let progress: WorkspaceProgress
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "hourglass")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.teal)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text(progress.title)
+                        .font(.callout.weight(.semibold))
+                    Text(progress.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                if let fraction = progress.fraction {
+                    ProgressView(value: fraction, total: 1)
+                        .progressViewStyle(.linear)
+                        .tint(.teal)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(.teal)
+                }
+            }
+
+            if let fraction = progress.fraction {
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 42, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 58)
+        .background(Color.teal.opacity(0.08))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.teal.opacity(0.22))
+                .frame(height: 1)
+        }
     }
 }
 
@@ -626,7 +692,7 @@ private struct DeleteKeyMonitor: NSViewRepresentable {
     }
 }
 
-private nonisolated func gateItemProvider(_ payload: String) -> NSItemProvider {
+nonisolated func gateItemProvider(_ payload: String) -> NSItemProvider {
     let provider = NSItemProvider()
     provider.registerDataRepresentation(forTypeIdentifier: UTType.plainText.identifier, visibility: .all) { completion in
         completion(Data(payload.utf8), nil)
@@ -635,7 +701,7 @@ private nonisolated func gateItemProvider(_ payload: String) -> NSItemProvider {
     return provider
 }
 
-private nonisolated func gatePayload(from item: NSSecureCoding?) -> String? {
+nonisolated func gatePayload(from item: NSSecureCoding?) -> String? {
     if let string = item as? String {
         return string
     }
@@ -675,7 +741,7 @@ private struct WorkspaceRowView: View {
             HStack(spacing: 6) {
                 Spacer()
                     .frame(width: CGFloat(row.depth) * 18)
-                Image(systemName: row.isGate ? "skew" : "doc")
+                Image(systemName: row.isGate ? "skew" : row.role == "Cells" ? "tablecells" : "doc")
                     .foregroundStyle(row.isGate ? .orange : .blue)
                 if isEditing {
                     TextField("Name", text: $editName)
@@ -689,7 +755,7 @@ private struct WorkspaceRowView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(row.isGroupGate ? "Template" : row.isGate ? "Count" : "Events")
+            Text(row.isGroupGate ? "Template" : row.isGate ? "Count" : row.role)
                 .foregroundStyle(.secondary)
                 .frame(width: 100, alignment: .trailing)
 

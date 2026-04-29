@@ -17,14 +17,29 @@ DMG_WINDOW_RIGHT=$((DMG_WINDOW_LEFT + DMG_BACKGROUND_SIZE))
 DMG_WINDOW_BOTTOM=$((DMG_WINDOW_TOP + DMG_BACKGROUND_SIZE))
 
 cd "$ROOT_DIR"
-swift build -c release
 
-BIN_PATH="$(swift build -c release --show-bin-path)/$APP_NAME"
+echo "Building x86_64 slice..."
+swift build -c release --arch x86_64 --product "$APP_NAME"
+X64_BIN="$(swift build -c release --arch x86_64 --show-bin-path)/$APP_NAME"
+
+echo "Building arm64 slice..."
+swift build -c release --arch arm64 --product "$APP_NAME"
+ARM_BIN="$(swift build -c release --arch arm64 --show-bin-path)/$APP_NAME"
 
 rm -rf "$DIST_DIR"
 mkdir -p "$STAGE_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
+
+echo "Creating universal binary..."
+lipo -create "$X64_BIN" "$ARM_BIN" \
+    -output "$APP_DIR/Contents/MacOS/$APP_NAME"
+
+chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
+
+echo "Verifying universal binary..."
+lipo "$APP_DIR/Contents/MacOS/$APP_NAME" -archs
+lipo "$APP_DIR/Contents/MacOS/$APP_NAME" -verify_arch x86_64 arm64
+
 if [ -d "$RESOURCE_DIR" ]; then
     cp -R "$RESOURCE_DIR"/. "$APP_DIR/Contents/Resources/"
 fi
@@ -32,6 +47,7 @@ fi
 ICON_PNG="$RESOURCE_DIR/OpenFloClosed.png"
 OPEN_ICON_PNG="$RESOURCE_DIR/OpenFloOpen.png"
 ICONSET_DIR="$DIST_DIR/OpenFloClosed.iconset"
+
 if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 && [ -f "$ICON_PNG" ]; then
     mkdir -p "$ICONSET_DIR"
     while read -r size filename; do
@@ -54,6 +70,7 @@ fi
 BACKGROUND_DIR="$STAGE_DIR/.background"
 BACKGROUND_PNG="$BACKGROUND_DIR/OpenFloDMGBackground.png"
 mkdir -p "$BACKGROUND_DIR"
+
 if command -v sips >/dev/null 2>&1 && [ -f "$OPEN_ICON_PNG" ]; then
     sips -z "$DMG_BACKGROUND_SIZE" "$DMG_BACKGROUND_SIZE" "$OPEN_ICON_PNG" --out "$BACKGROUND_PNG" >/dev/null
 elif [ -f "$OPEN_ICON_PNG" ]; then
@@ -80,9 +97,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.7.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -92,8 +109,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 PLIST
 
 ln -s /Applications "$STAGE_DIR/Applications"
+
 rm -f "$DMG_PATH" "$RW_DMG_PATH"
 rm -rf "$MOUNT_DIR"
+
+echo "Creating read-write DMG..."
 hdiutil create \
     -volname "$APP_NAME" \
     -srcfolder "$STAGE_DIR" \
@@ -104,10 +124,14 @@ hdiutil create \
 
 if command -v osascript >/dev/null 2>&1 && [ -f "$BACKGROUND_PNG" ]; then
     mkdir -p "$MOUNT_DIR"
+
+    echo "Mounting DMG to customize Finder layout..."
     hdiutil attach "$RW_DMG_PATH" -readwrite -noverify -noautoopen -mountpoint "$MOUNT_DIR" >/dev/null
+
     cleanup_mount() {
         hdiutil detach "$MOUNT_DIR" -quiet >/dev/null 2>&1 || true
     }
+
     trap cleanup_mount EXIT
 
     osascript <<APPLESCRIPT
@@ -139,11 +163,13 @@ APPLESCRIPT
     rm -rf "$MOUNT_DIR"
 fi
 
+echo "Compressing final DMG..."
 hdiutil convert "$RW_DMG_PATH" \
     -format UDZO \
     -imagekey zlib-level=9 \
     -o "$DMG_PATH" \
     -ov >/dev/null
+
 rm -f "$RW_DMG_PATH"
 
 echo "Created $DMG_PATH"

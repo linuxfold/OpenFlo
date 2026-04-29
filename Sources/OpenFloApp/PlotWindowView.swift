@@ -41,7 +41,9 @@ struct PlotWindowView: View {
                     axesChangedPreservingGate()
                 },
                 onYChannelChange: { channel in
-                    model.plotMode = .scatter
+                    if model.plotMode.isOneDimensional {
+                        model.plotMode = model.defaultBiaxialPlotMode
+                    }
                     model.yChannel = channel
                     axesChangedPreservingGate()
                 },
@@ -76,6 +78,8 @@ struct PlotWindowView: View {
                 }
             )
             .background(Color.white)
+
+            PlotOptionsPanel(model: model)
         }
         .onAppear {
             restoreGateForCurrentAxes()
@@ -517,7 +521,9 @@ struct StandalonePlotPaneView: View {
                     model.axesChanged()
                 },
                 onYChannelChange: { channel in
-                    model.plotMode = .scatter
+                    if model.plotMode.isOneDimensional {
+                        model.plotMode = model.defaultBiaxialPlotMode
+                    }
                     model.yChannel = channel
                     model.axesChanged()
                 },
@@ -561,7 +567,87 @@ struct StandalonePlotPaneView: View {
                     model.openAxisCustomizationWindow(for: axis)
                 }
             )
+
+            PlotOptionsPanel(model: model)
         }
+    }
+}
+
+private struct PlotOptionsPanel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .foregroundStyle(.teal)
+                Text("Options")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.teal.opacity(0.35))
+                    .frame(height: 1)
+            }
+
+            HStack(spacing: 18) {
+                Picker("Type:", selection: plotModeBinding) {
+                    ForEach(PlotMode.allCases) { mode in
+                        Text(mode.rawValue)
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 260)
+
+                HStack(spacing: 8) {
+                    Text("Level:")
+                        .font(.callout.weight(.semibold))
+                    Stepper(
+                        "\(model.contourLevelPercent)%",
+                        value: contourLevelBinding,
+                        in: 1...25,
+                        step: 1
+                    )
+                    .frame(width: 112)
+                }
+                .disabled(!model.plotMode.usesDensityLevel)
+                .opacity(model.plotMode.usesDensityLevel ? 1 : 0.45)
+
+                Spacer()
+
+                Text(model.plotMode.isOneDimensional ? model.currentXChannelName : "\(model.currentXChannelName) x \(model.currentYChannelName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 58)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .frame(height: 88)
+        .overlay(Rectangle().stroke(Color.black.opacity(0.25), lineWidth: 1))
+    }
+
+    private var plotModeBinding: Binding<PlotMode> {
+        Binding(
+            get: { model.plotMode },
+            set: { model.plotModeChanged($0) }
+        )
+    }
+
+    private var contourLevelBinding: Binding<Int> {
+        Binding(
+            get: { model.contourLevelPercent },
+            set: { model.setContourLevelPercent($0) }
+        )
     }
 }
 

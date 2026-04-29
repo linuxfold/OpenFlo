@@ -32,11 +32,35 @@ enum GateTool: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum PlotMode: String, CaseIterable, Identifiable, Sendable {
-    case scatter = "Scatter"
+enum PlotMode: String, CaseIterable, Codable, Identifiable, Sendable {
+    case contour = "Contour Plot"
+    case density = "Density Plot"
+    case zebra = "Zebra Plot"
+    case pseudocolor = "Pseudocolor"
+    case heatmapStatistic = "Heatmap Statistic"
+    case dot = "Dot Plot"
     case histogram = "Histogram"
+    case cdf = "CDF"
 
     var id: String { rawValue }
+
+    var isOneDimensional: Bool {
+        switch self {
+        case .histogram, .cdf:
+            return true
+        case .contour, .density, .zebra, .pseudocolor, .heatmapStatistic, .dot:
+            return false
+        }
+    }
+
+    var usesDensityLevel: Bool {
+        switch self {
+        case .contour, .zebra:
+            return true
+        case .density, .pseudocolor, .heatmapStatistic, .dot, .histogram, .cdf:
+            return false
+        }
+    }
 }
 
 @MainActor
@@ -51,7 +75,8 @@ final class AppModel: ObservableObject {
     @Published var xTransform: TransformKind = .linear
     @Published var yTransform: TransformKind = .linear
     @Published var gateTool: GateTool = .cursor
-    @Published var plotMode: PlotMode = .scatter
+    @Published var plotMode: PlotMode = .pseudocolor
+    @Published var contourLevelPercent: Int = 5
     @Published private(set) var plotImage: NSImage?
     @Published private(set) var xRange: ClosedRange<Float> = 0...1
     @Published private(set) var yRange: ClosedRange<Float> = 0...1
@@ -77,13 +102,15 @@ final class AppModel: ObservableObject {
         xTransform: TransformKind = .linear,
         yTransform: TransformKind = .linear,
         xAxisSettings: AxisDisplaySettings? = nil,
-        yAxisSettings: AxisDisplaySettings? = nil
+        yAxisSettings: AxisDisplaySettings? = nil,
+        plotMode: PlotMode? = nil
     ) {
         self.table = table
         self.baseMask = baseMask
         self.populationTitle = populationTitle
         self.xTransform = xTransform
         self.yTransform = yTransform
+        self.plotMode = plotMode ?? Self.defaultPlotMode(for: table)
         if let xChannel, let yChannel {
             self.xChannel = xChannel
             self.yChannel = yChannel
@@ -116,6 +143,16 @@ final class AppModel: ObservableObject {
 
     var channels: [Channel] {
         table.channels
+    }
+
+    var axisSelectableChannelIndices: [Int] {
+        let signatureIndices = channels.indices.filter { channels[$0].kind == .seqtometrySignature }
+        return signatureIndices.isEmpty ? Array(channels.indices) : signatureIndices
+    }
+
+    var defaultBiaxialPlotMode: PlotMode {
+        let preferred = Self.defaultPlotMode(for: table)
+        return preferred.isOneDimensional ? .pseudocolor : preferred
     }
 
     var selectedCountText: String {
@@ -154,7 +191,7 @@ final class AppModel: ObservableObject {
         case .x:
             return xRange
         case .y:
-            return plotMode == .histogram ? xRange : yRange
+            return plotMode.isOneDimensional ? xRange : yRange
         }
     }
 
@@ -163,7 +200,7 @@ final class AppModel: ObservableObject {
         case .x:
             return xChannel
         case .y:
-            return plotMode == .histogram ? xChannel : yChannel
+            return plotMode.isOneDimensional ? xChannel : yChannel
         }
     }
 
@@ -299,9 +336,19 @@ final class AppModel: ObservableObject {
 
     func plotModeChanged(_ mode: PlotMode) {
         guard plotMode != mode else { return }
+        let changedDimensionality = plotMode.isOneDimensional != mode.isOneDimensional
         plotMode = mode
-        clearGate(recompute: false)
+        if changedDimensionality {
+            clearGate(recompute: false)
+        }
         recomputePlot(reason: "\(mode.rawValue) view")
+    }
+
+    func setContourLevelPercent(_ percent: Int) {
+        let clamped = min(max(percent, 1), 25)
+        guard contourLevelPercent != clamped else { return }
+        contourLevelPercent = clamped
+        recomputePlot(reason: "\(plotMode.rawValue) level \(clamped)%")
     }
 
     func transformsChanged() {
@@ -321,6 +368,7 @@ final class AppModel: ObservableObject {
         let xSettings = axisSettings(forChannel: xChannel)
         let ySettings = axisSettings(forChannel: yChannel)
         let plotMode = self.plotMode
+        let contourLevelPercent = self.contourLevelPercent
         let baseMask: EventMask?
         let repairedPopulationMask: Bool
         if let currentBaseMask = self.baseMask, currentBaseMask.count != table.rowCount {
@@ -338,22 +386,52 @@ final class AppModel: ObservableObject {
             let resolvedXRange = xSettings.resolvedRange(auto: EventTable.range(values: xValues, mask: baseMask))
             let resolvedYRange: ClosedRange<Float>
             let image: NSImage
-            if plotMode == .histogram {
+            if plotMode.isOneDimensional {
                 let histogram = Histogram1D.build(values: xValues, mask: baseMask, width: 640, xRange: resolvedXRange)
-                resolvedYRange = Self.histogramYRange(maxBin: histogram.maxBin)
-                image = HistogramRenderer.image(from: histogram, yRange: resolvedYRange)
+                if plotMode == .cdf {
+                    resolvedYRange = 0...1
+                    image = CDFRenderer.image(from: histogram, yRange: resolvedYRange)
+                } else {
+                    resolvedYRange = Self.histogramYRange(maxBin: histogram.maxBin)
+                    image = HistogramRenderer.image(from: histogram, yRange: resolvedYRange)
+                }
             } else {
                 resolvedYRange = ySettings.resolvedRange(auto: EventTable.range(values: yValues, mask: baseMask))
-                let histogram = Histogram2D.build(
-                    xValues: xValues,
-                    yValues: yValues,
-                    mask: baseMask,
-                    width: 640,
-                    height: 640,
-                    xRange: resolvedXRange,
-                    yRange: resolvedYRange
-                )
-                image = HeatmapRenderer.image(from: histogram)
+                if plotMode == .dot {
+                    image = DotPlotRenderer.image(
+                        xValues: xValues,
+                        yValues: yValues,
+                        mask: baseMask,
+                        width: 640,
+                        height: 640,
+                        xRange: resolvedXRange,
+                        yRange: resolvedYRange
+                    )
+                } else {
+                    let histogram = Histogram2D.build(
+                        xValues: xValues,
+                        yValues: yValues,
+                        mask: baseMask,
+                        width: 640,
+                        height: 640,
+                        xRange: resolvedXRange,
+                        yRange: resolvedYRange
+                    )
+                    switch plotMode {
+                    case .contour:
+                        image = DensityPlotRenderer.image(from: histogram, style: .contour, levelPercent: contourLevelPercent)
+                    case .density:
+                        image = DensityPlotRenderer.image(from: histogram, style: .density, levelPercent: contourLevelPercent)
+                    case .zebra:
+                        image = DensityPlotRenderer.image(from: histogram, style: .zebra, levelPercent: contourLevelPercent)
+                    case .pseudocolor:
+                        image = HeatmapRenderer.image(from: histogram)
+                    case .heatmapStatistic:
+                        image = DensityPlotRenderer.image(from: histogram, style: .heatmapStatistic, levelPercent: contourLevelPercent)
+                    case .dot, .histogram, .cdf:
+                        image = HeatmapRenderer.image(from: histogram)
+                    }
+                }
             }
 
             Task { @MainActor in
@@ -557,8 +635,15 @@ final class AppModel: ObservableObject {
     }
 
     static func defaultAxisSelection(for table: EventTable) -> (x: Int, y: Int) {
-        let names = table.channels.map { $0.name.uppercased() }
+        let signatureIndices = table.channels.indices.filter { table.channels[$0].kind == .seqtometrySignature }
+        if signatureIndices.count >= 2 {
+            return (signatureIndices[0], signatureIndices[1])
+        }
+        if let signatureIndex = signatureIndices.first {
+            return (signatureIndex, signatureIndex)
+        }
 
+        let names = table.channels.map { $0.name.uppercased() }
         let x = firstIndex(in: names, exactly: "FSC-A")
             ?? firstIndex(in: names, containingAll: ["FSC", "-A"])
             ?? firstIndex(in: names, containingAll: ["FSC"])
@@ -575,11 +660,22 @@ final class AppModel: ObservableObject {
     }
 
     static func defaultTransform(for channel: Channel) -> TransformKind {
+        if let preferredTransform = channel.preferredTransform {
+            return preferredTransform
+        }
         let name = "\(channel.name) \(channel.displayName)".uppercased()
         if name.contains("FSC") || name.contains("SSC") || channel.name.uppercased() == "TIME" {
             return .linear
         }
         return .logicle
+    }
+
+    static func defaultPlotMode(for _: EventTable) -> PlotMode {
+        .pseudocolor
+    }
+
+    nonisolated static func histogramPreviewRange(maxBin: UInt32) -> ClosedRange<Float> {
+        histogramYRange(maxBin: maxBin)
     }
 
     private static func firstIndex(in names: [String], exactly target: String, excluding excluded: Int? = nil) -> Int? {

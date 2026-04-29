@@ -7,18 +7,27 @@ public struct Channel: Equatable, Sendable, Identifiable {
     public let bitWidth: Int?
     public let markerName: String?
     public let fluorochromeName: String?
+    public let kind: ChannelKind
+    public let preferredTransform: TransformKind?
+    public let signatureGenes: [String]
 
     public init(
         name: String,
         displayName: String? = nil,
         bitWidth: Int? = nil,
         markerName: String? = nil,
-        fluorochromeName: String? = nil
+        fluorochromeName: String? = nil,
+        kind: ChannelKind = .measurement,
+        preferredTransform: TransformKind? = nil,
+        signatureGenes: [String] = []
     ) {
         self.name = name
         self.bitWidth = bitWidth
         self.markerName = markerName
         self.fluorochromeName = fluorochromeName
+        self.kind = kind
+        self.preferredTransform = preferredTransform
+        self.signatureGenes = signatureGenes
 
         if let displayName {
             self.displayName = displayName
@@ -30,6 +39,12 @@ public struct Channel: Equatable, Sendable, Identifiable {
             self.displayName = name
         }
     }
+}
+
+public enum ChannelKind: String, Equatable, Sendable {
+    case measurement
+    case singleCellFeature
+    case seqtometrySignature
 }
 
 public final class EventTable: @unchecked Sendable {
@@ -54,6 +69,24 @@ public final class EventTable: @unchecked Sendable {
     public func column(_ index: Int) -> [Float] {
         precondition(index >= 0 && index < columns.count, "Channel index out of bounds")
         return columns[index]
+    }
+
+    public func replacingOrAppending(channels newChannels: [Channel], columns newColumns: [[Float]]) -> EventTable {
+        precondition(newChannels.count == newColumns.count, "Channel and column counts must match")
+        precondition(newColumns.allSatisfy { $0.count == rowCount }, "Columns must have the same row count")
+
+        var outputChannels = channels
+        var outputColumns = columns
+        for index in newChannels.indices {
+            if let existingIndex = outputChannels.firstIndex(where: { $0.name == newChannels[index].name }) {
+                outputChannels[existingIndex] = newChannels[index]
+                outputColumns[existingIndex] = newColumns[index]
+            } else {
+                outputChannels.append(newChannels[index])
+                outputColumns.append(newColumns[index])
+            }
+        }
+        return EventTable(channels: outputChannels, columns: outputColumns)
     }
 
     public func value(event: Int, channel: Int) -> Float {

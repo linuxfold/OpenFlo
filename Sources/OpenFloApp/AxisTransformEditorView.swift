@@ -204,7 +204,7 @@ struct AxisTransformEditorView: View {
                 .padding(.top, 12)
 
             List(selection: $selectedChannels) {
-                ForEach(model.channels.indices, id: \.self) { index in
+                ForEach(model.axisSelectableChannelIndices, id: \.self) { index in
                     Text(model.channels[index].displayName)
                         .tag(index)
                 }
@@ -212,7 +212,7 @@ struct AxisTransformEditorView: View {
 
             HStack {
                 Button("All") {
-                    selectedChannels = Set(model.channels.indices)
+                    selectedChannels = Set(model.axisSelectableChannelIndices)
                 }
                 Button("Current") {
                     selectedChannels = [model.channelIndex(for: axis)]

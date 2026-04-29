@@ -118,6 +118,62 @@ func testFCSMarkerFluorochromeLabels() throws {
     expect(channel.displayName == "CD86 (AF647)", "display name should combine marker and fluorochrome")
 }
 
+func testSingleCellDelimitedParserGenesByCells() throws {
+    let rows = [
+        ["gene", "Cell1", "Cell2"],
+        ["CD3D", "1", "2"],
+        ["MS4A1", "3", "4"]
+    ]
+    let file = try SingleCellDataParser.parseDelimited(rows: rows)
+
+    expect(file.orientation == .genesByCells, "gene-labeled matrix should parse as genes x cells")
+    expect(file.table.rowCount == 2, "single-cell rows should become cells")
+    expect(file.table.channelCount == 2, "single-cell columns should become genes")
+    expect(file.table.channels[0].kind == .singleCellFeature, "genes should be marked as single-cell features")
+    expect(file.table.value(event: 1, channel: 0) == 2, "gene x cell values should parse")
+}
+
+func testSeqtometrySignatureParser() throws {
+    let text = """
+    name\tvalue
+    T cell\tCD3D,TRAC,CD3G
+    B cell\tMS4A1 CD79A
+    """
+    let signatures = try SeqtometrySignatureParser.parse(text: text, filename: "signatures.tsv")
+
+    expect(signatures.count == 2, "signature parser should read name/value rows")
+    expect(signatures[0].genes == ["CD3D", "TRAC", "CD3G"], "comma-separated signature genes should parse")
+    expect(signatures[1].genes == ["MS4A1", "CD79A"], "whitespace-separated signature genes should parse")
+}
+
+func testSeqtometryScoreMatchesReferenceExample() throws {
+    let channels = ["a", "b", "c", "d", "e"].map {
+        Channel(name: $0, kind: .singleCellFeature, preferredTransform: .linear)
+    }
+    let table = EventTable(
+        channels: channels,
+        columns: [
+            [1, 8, 3],
+            [2, 7, 4],
+            [0, 9, 2],
+            [4, 0, 0],
+            [5, 2, 1]
+        ]
+    )
+    let signatures = [SeqtometrySignature(name: "Sig", genes: ["a", "c"])]
+    let scored = try SeqtometryScorer.tableByAppendingScores(to: table, signatures: signatures)
+    guard let scoreIndex = scored.channels.firstIndex(where: { $0.name == "Sig" }) else {
+        fatalError("signature score channel should be appended")
+    }
+
+    let scores = scored.column(scoreIndex)
+    expect(scores.count == 3, "signature score should have one value per cell")
+    expect(abs(scores[0] - 0) < 0.0001, "first reference score should match")
+    expect(abs(scores[1] - 1) < 0.0001, "second reference score should match")
+    expect(abs(scores[2] - 0.5) < 0.0001, "third reference score should match")
+    expect(scored.channels[scoreIndex].kind == .seqtometrySignature, "score channels should be marked as signatures")
+}
+
 func singleFloatFCS(
     value: Float,
     byteOrder: String,
@@ -192,4 +248,7 @@ testRangesTolerateInvalidMasks()
 try testFCSTextParserHandlesEscapedDelimiter()
 try testFCSFloatByteOrders()
 try testFCSMarkerFluorochromeLabels()
+try testSingleCellDelimitedParserGenesByCells()
+try testSeqtometrySignatureParser()
+try testSeqtometryScoreMatchesReferenceExample()
 print("OpenFloCore smoke tests passed")

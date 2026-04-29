@@ -20,7 +20,7 @@ enum AxisRangeBound: Sendable {
     case maximum
 }
 
-struct AxisDisplaySettings: Equatable, Sendable {
+struct AxisDisplaySettings: Codable, Equatable, Sendable {
     var transform: TransformKind
     var minimum: Float?
     var maximum: Float?

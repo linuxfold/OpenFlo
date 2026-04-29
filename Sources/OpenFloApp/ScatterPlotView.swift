@@ -66,6 +66,11 @@ struct ScatterPlotView: View {
         return gates.first { $0.id == labeledGateID }
     }
 
+    private var axisSelectableChannelIndices: [Int] {
+        let signatureIndices = channels.indices.filter { channels[$0].kind == .seqtometrySignature }
+        return signatureIndices.isEmpty ? Array(channels.indices) : signatureIndices
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let plotRect = squarePlotRect(in: geometry.size)
@@ -125,23 +130,31 @@ struct ScatterPlotView: View {
                         onHistogram: {}
                     )
 
+                    signatureGenesMenu(for: channels[xChannel])
+
                     axisTransformButton(axis: .x, transform: xTransform)
                 }
                 .position(x: plotRect.midX + 22, y: min(geometry.size.height - 22, plotRect.maxY + 50))
 
-                axisMenu(
-                    label: plotMode == .histogram ? "Histogram" : channels[yChannel].displayName,
-                    selected: plotMode == .histogram ? nil : yChannel,
-                    includeHistogram: true,
-                    onSelect: onYChannelChange,
-                    onHistogram: {
-                        onPlotModeChange(.histogram)
+                HStack(spacing: 6) {
+                    axisMenu(
+                        label: plotMode.isOneDimensional ? plotMode.rawValue : channels[yChannel].displayName,
+                        selected: plotMode.isOneDimensional ? nil : yChannel,
+                        includeHistogram: true,
+                        onSelect: onYChannelChange,
+                        onHistogram: {
+                            onPlotModeChange(.histogram)
+                        }
+                    )
+
+                    if !plotMode.isOneDimensional {
+                        signatureGenesMenu(for: channels[yChannel])
                     }
-                )
+                }
                 .rotationEffect(.degrees(-90))
                 .position(x: max(18, plotRect.minX - 70), y: plotRect.midY)
 
-                if plotMode != .histogram {
+                if !plotMode.isOneDimensional {
                     axisTransformButton(axis: .y, transform: yTransform)
                         .position(x: max(18, plotRect.minX - 70), y: plotRect.midY - 78)
                 }
@@ -615,7 +628,7 @@ struct ScatterPlotView: View {
             context.draw(text, at: CGPoint(x: x, y: plotRect.maxY + 11), anchor: .top)
         }
 
-        let yAxisTicks = plotMode == .histogram
+        let yAxisTicks = plotMode.isOneDimensional
             ? linearTicks(in: yRange, targetCount: 6)
             : ticks(for: yRange, transform: yTransform, targetCount: 6)
         for tick in yAxisTicks {
@@ -778,7 +791,7 @@ struct ScatterPlotView: View {
                 Divider()
             }
 
-            ForEach(channels.indices, id: \.self) { index in
+            ForEach(axisSelectableChannelIndices, id: \.self) { index in
                 Button {
                     onSelect(index)
                 } label: {
@@ -805,6 +818,39 @@ struct ScatterPlotView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+    }
+
+    @ViewBuilder
+    private func signatureGenesMenu(for channel: Channel) -> some View {
+        let genes = channel.signatureGenes
+        if !genes.isEmpty {
+            Menu {
+                ForEach(genes.indices, id: \.self) { index in
+                    Text(genes[index])
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(signatureGeneLabel(for: genes))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .font(.caption)
+                .foregroundStyle(.black)
+                .padding(.horizontal, 10)
+                .frame(minWidth: 74, minHeight: 25)
+                .background(Color(nsColor: .controlColor))
+                .overlay(Rectangle().stroke(.black.opacity(0.45), lineWidth: 1))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("\(channel.displayName) signature genes")
+        }
+    }
+
+    private func signatureGeneLabel(for genes: [String]) -> String {
+        guard let first = genes.first, !first.isEmpty else { return "Genes" }
+        return first
     }
 
     private func axisTransformButton(axis: PlotAxis, transform: TransformKind) -> some View {

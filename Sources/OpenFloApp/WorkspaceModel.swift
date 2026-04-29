@@ -4,7 +4,7 @@ import OpenFloCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct WorkspaceSelection: Equatable, Sendable {
+struct WorkspaceSelection: Codable, Equatable, Hashable, Sendable {
     static let allSamplesID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let allSamples = WorkspaceSelection(sampleID: allSamplesID, gateID: nil)
 
@@ -28,14 +28,77 @@ struct WorkspaceRow: Identifiable, Equatable {
     let isSynced: Bool
 }
 
-struct WorkspaceLayout: Identifiable, Equatable {
+struct WorkspaceLayout: Codable, Identifiable, Equatable {
     let id: UUID
     var name: String
+    var items: [WorkspaceLayoutItem]
+    var zoom: Double
+    var showGrid: Bool
+    var showPageBreaks: Bool
+    var iterationMode: LayoutIterationMode
+    var iterationSampleID: UUID?
+    var batchDestination: LayoutBatchDestination
+    var batchAxis: LayoutBatchAxis
+    var batchCount: Int
+    var batchAcross: Bool
 
-    init(id: UUID = UUID(), name: String) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        items: [WorkspaceLayoutItem] = [],
+        zoom: Double = 1,
+        showGrid: Bool = false,
+        showPageBreaks: Bool = true,
+        iterationMode: LayoutIterationMode = .off,
+        iterationSampleID: UUID? = nil,
+        batchDestination: LayoutBatchDestination = .layout,
+        batchAxis: LayoutBatchAxis = .columns,
+        batchCount: Int = 3,
+        batchAcross: Bool = true
+    ) {
         self.id = id
         self.name = name
+        self.items = items
+        self.zoom = zoom
+        self.showGrid = showGrid
+        self.showPageBreaks = showPageBreaks
+        self.iterationMode = iterationMode
+        self.iterationSampleID = iterationSampleID
+        self.batchDestination = batchDestination
+        self.batchAxis = batchAxis
+        self.batchCount = batchCount
+        self.batchAcross = batchAcross
     }
+}
+
+struct WorkspaceProgress: Equatable {
+    let title: String
+    let detail: String
+    let fraction: Double?
+}
+
+struct LayoutGateRenderStep: Sendable {
+    let gate: PolygonGate
+    let xIndex: Int
+    let yIndex: Int
+    let xAxisSettings: AxisDisplaySettings
+    let yAxisSettings: AxisDisplaySettings
+}
+
+struct LayoutPlotRenderPayload: Sendable {
+    let table: EventTable
+    let sampleKind: WorkspaceSampleKind
+    let mask: EventMask?
+    let gateSteps: [LayoutGateRenderStep]
+    let sampleName: String
+    let populationName: String
+    let eventCount: Int
+    let xIndex: Int
+    let yIndex: Int
+    let xAxisSettings: AxisDisplaySettings
+    let yAxisSettings: AxisDisplaySettings
+    let mode: PlotMode
+    let ancestry: [String]
 }
 
 final class WorkspaceGateNode: Identifiable, ObservableObject {
@@ -96,16 +159,39 @@ final class WorkspaceGateNode: Identifiable, ObservableObject {
 final class WorkspaceSample: Identifiable, ObservableObject {
     let id: UUID
     let url: URL?
+    let kind: WorkspaceSampleKind
     @Published var name: String
     @Published var table: EventTable
     @Published var gates: [WorkspaceGateNode]
 
-    init(id: UUID = UUID(), name: String, url: URL?, table: EventTable, gates: [WorkspaceGateNode] = []) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        url: URL?,
+        kind: WorkspaceSampleKind,
+        table: EventTable,
+        gates: [WorkspaceGateNode] = []
+    ) {
         self.id = id
         self.name = name
         self.url = url
+        self.kind = kind
         self.table = table
         self.gates = gates
+    }
+}
+
+enum WorkspaceSampleKind: String, Codable, Equatable, Sendable {
+    case fcs
+    case singleCell
+
+    var rowLabel: String {
+        switch self {
+        case .fcs:
+            return "Events"
+        case .singleCell:
+            return "Cells"
+        }
     }
 }
 
@@ -116,11 +202,23 @@ final class WorkspaceModel: ObservableObject {
     @Published var selected: WorkspaceSelection?
     @Published var layouts: [WorkspaceLayout] = [WorkspaceLayout(name: "Layout")]
     @Published var selectedLayoutID: UUID?
-    @Published private(set) var status: String = "Drop .fcs files here or add samples."
-    @Published private(set) var gateChangeVersion = 0
+    @Published private(set) var status: String = "Drop .fcs or single-cell files here or add samples."
+    @Published private(set) var progress: WorkspaceProgress?
+    @Published private(set) var gateChangeVersion = 0 {
+        didSet {
+            layoutPlotSnapshotCache.removeAll()
+        }
+    }
     private var lastCreatedGate: WorkspaceSelection?
     private var plotWindowControllers: [NSWindowController] = []
     private var layoutWindowControllers: [NSWindowController] = []
+    private var tableWindowControllers: [NSWindowController] = []
+    private var layoutPlotSnapshotCache: [String: LayoutPlotSnapshot] = [:]
+    private var gateMaskCache: [String: EventMask] = [:]
+    private var channelIndexLookupCache: [ObjectIdentifier: [String: Int]] = [:]
+    private var signatureChannelNameCache: [ObjectIdentifier: [String]] = [:]
+    private var loadedSignatures: [SeqtometrySignature] = []
+    private var activeProgressID: UUID?
 
     var rows: [WorkspaceRow] {
         samples.flatMap { sample in
@@ -131,7 +229,7 @@ final class WorkspaceModel: ObservableObject {
                     depth: 0,
                     name: sample.name,
                     count: sample.table.rowCount,
-                    role: "Sample",
+                    role: sample.kind.rowLabel,
                     isGate: false,
                     isGroupGate: false,
                     isSynced: sampleMatchesAllTemplates(sample)
@@ -170,11 +268,16 @@ final class WorkspaceModel: ObservableObject {
         status = "Loading \(fcsURLs.count) FCS file(s)..."
 
         for url in fcsURLs {
+            let progressID = beginProgress(
+                title: "Loading Sample",
+                detail: "Reading \(url.lastPathComponent)",
+                fraction: nil
+            )
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let file = try FCSParser.load(url: url)
                     Task { @MainActor in
-                        let sample = WorkspaceSample(name: url.lastPathComponent, url: url, table: file.table)
+                        let sample = WorkspaceSample(name: url.lastPathComponent, url: url, kind: .fcs, table: file.table)
                         self.samples.append(sample)
                         if !self.groupGates.isEmpty {
                             self.applyGroupTemplatesToSamples()
@@ -182,13 +285,115 @@ final class WorkspaceModel: ObservableObject {
                         if self.selected == nil {
                             self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
                         }
-                        self.status = "Loaded \(url.lastPathComponent)."
+                        self.finishProgress(progressID, status: "Loaded \(url.lastPathComponent).")
                     }
                 } catch {
                     Task { @MainActor in
-                        self.status = "Could not load \(url.lastPathComponent): \(error.localizedDescription)"
+                        self.finishProgress(progressID, status: "Could not load \(url.lastPathComponent): \(error.localizedDescription)")
                     }
                 }
+            }
+        }
+    }
+
+    func addDataURLs(_ urls: [URL]) {
+        let fcsURLs = urls.filter { $0.pathExtension.lowercased() == "fcs" }
+        let signatureURLs = urls.filter { SeqtometrySignatureParser.isLikelySignatureFile(url: $0) }
+        let singleCellURLs = urls.filter { url in
+            !fcsURLs.contains(url) && !signatureURLs.contains(url)
+        }
+
+        addFCSURLs(fcsURLs)
+        addSignatureURLs(signatureURLs)
+        addSingleCellURLs(singleCellURLs)
+    }
+
+    func addSingleCellURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard let signatureSet = chooseSignaturesForSingleCellLoad(matrixURLs: urls) else {
+            status = "Single-cell import canceled."
+            return
+        }
+        mergeSignatures(signatureSet.addedSignatures)
+        let signatures = signatureSet.signatures
+        status = "Loading \(urls.count) single-cell file(s)..."
+
+        for url in urls {
+            let progressID = beginProgress(
+                title: "Loading Single-Cell Sample",
+                detail: "Reading \(url.lastPathComponent)",
+                fraction: nil
+            )
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let file = try SingleCellDataParser.load(url: url)
+                    Task { @MainActor in
+                        self.updateProgress(
+                            progressID,
+                            title: "Loading Single-Cell Sample",
+                            detail: "Parsed \(file.table.rowCount.formatted()) cells and \(file.table.channelCount.formatted()) genes",
+                            fraction: signatures.isEmpty ? 0.75 : 0.25
+                        )
+                    }
+                    let table = signatures.isEmpty
+                        ? file.table
+                        : try SeqtometryScorer.tableByAppendingScores(
+                            to: file.table,
+                            signatures: signatures,
+                            progress: { progress in
+                                Task { @MainActor in
+                                    self.updateScoringProgress(
+                                        progressID,
+                                        sampleName: url.lastPathComponent,
+                                        progress: progress,
+                                        lowerBound: 0.25,
+                                        upperBound: 0.96
+                                    )
+                                }
+                            }
+                        )
+                    Task { @MainActor in
+                        let sample = WorkspaceSample(name: url.lastPathComponent, url: url, kind: .singleCell, table: table)
+                        self.samples.append(sample)
+                        if !self.groupGates.isEmpty {
+                            self.applyGroupTemplatesToSamples()
+                        }
+                        if self.selected == nil {
+                            self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
+                        }
+                        if signatures.isEmpty {
+                            self.finishProgress(
+                                progressID,
+                                status: "Loaded \(url.lastPathComponent). Drop a Seqtometry signature file to add score channels."
+                            )
+                        } else {
+                            let source = signatureSet.sourceName.map { " from \($0)" } ?? ""
+                            self.finishProgress(
+                                progressID,
+                                status: "Loaded \(url.lastPathComponent) with \(signatures.count) signature score channel(s)\(source)."
+                            )
+                        }
+                    }
+                } catch {
+                    Task { @MainActor in
+                        self.finishProgress(progressID, status: "Could not load \(url.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    func addSignatureURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        status = "Loading \(urls.count) Seqtometry signature file(s)..."
+
+        for url in urls {
+            do {
+                let signatures = try SeqtometrySignatureParser.load(url: url)
+                mergeSignatures(signatures)
+                applySignaturesToSingleCellSamples(signatures, sourceName: url.lastPathComponent)
+            } catch {
+                status = "Could not load \(url.lastPathComponent): \(error.localizedDescription)"
             }
         }
     }
@@ -205,6 +410,92 @@ final class WorkspaceModel: ObservableObject {
         addFCSURLs(panel.urls)
     }
 
+    func openSingleCellPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK else { return }
+        addSingleCellURLs(panel.urls)
+    }
+
+    func openSignaturePanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        let types = ["tsv", "csv", "txt", "gmt"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = types
+        guard panel.runModal() == .OK else { return }
+        addSignatureURLs(panel.urls)
+    }
+
+    func downloadSeqtometryDemo() {
+        let progressID = beginProgress(
+            title: "Loading Demo Dataset",
+            detail: "Downloading PBMC3k demo data",
+            fraction: nil
+        )
+        Task {
+            do {
+                let signatures = try bundledSeqtometrySignatures()
+                mergeSignatures(signatures)
+                let matrixDirectory = try await SeqtometryDemoDownloader.pbmc3kMatrixDirectory()
+                updateProgress(
+                    progressID,
+                    title: "Loading Demo Dataset",
+                    detail: "Reading PBMC3k matrix",
+                    fraction: 0.18
+                )
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let file = try SingleCellDataParser.load(url: matrixDirectory)
+                        let table = try SeqtometryScorer.tableByAppendingScores(
+                            to: file.table,
+                            signatures: signatures,
+                            progress: { progress in
+                                Task { @MainActor in
+                                    self.updateScoringProgress(
+                                        progressID,
+                                        sampleName: "PBMC3k demo",
+                                        progress: progress,
+                                        lowerBound: 0.25,
+                                        upperBound: 0.96
+                                    )
+                                }
+                            }
+                        )
+                        Task { @MainActor in
+                            let sample = WorkspaceSample(
+                                name: "PBMC3k Seqtometry Demo",
+                                url: matrixDirectory,
+                                kind: .singleCell,
+                                table: table
+                            )
+                            self.samples.append(sample)
+                            if !self.groupGates.isEmpty {
+                                self.applyGroupTemplatesToSamples()
+                            }
+                            if self.selected == nil {
+                                self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
+                            }
+                            self.finishProgress(
+                                progressID,
+                                status: "Loaded PBMC3k demo with \(signatures.count) signature score channel(s)."
+                            )
+                        }
+                    } catch {
+                        Task { @MainActor in
+                            self.finishProgress(progressID, status: "Could not load PBMC3k demo: \(error.localizedDescription)")
+                        }
+                    }
+                }
+            } catch {
+                finishProgress(progressID, status: "Could not load PBMC3k demo: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func newWorkspace() {
         groupGates.removeAll()
         samples.removeAll()
@@ -212,8 +503,120 @@ final class WorkspaceModel: ObservableObject {
         layouts = [WorkspaceLayout(name: "Layout")]
         selectedLayoutID = layouts.first?.id
         lastCreatedGate = nil
+        layoutPlotSnapshotCache.removeAll()
+        gateMaskCache.removeAll()
+        loadedSignatures.removeAll()
+        progress = nil
+        activeProgressID = nil
         gateChangeVersion += 1
         status = "Started a new workspace."
+    }
+
+    func saveWorkspacePanel() {
+        let panel = NSSavePanel()
+        panel.title = "Save OpenFlo Workspace"
+        panel.nameFieldStringValue = "OpenFlo Workspace.openflo"
+        panel.allowedContentTypes = [UTType(filenameExtension: "openflo") ?? .json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try saveWorkspace(url: url)
+            status = "Saved workspace \(url.lastPathComponent)."
+        } catch {
+            status = "Could not save workspace: \(error.localizedDescription)"
+        }
+    }
+
+    func openWorkspacePanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Open OpenFlo Workspace"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "openflo") ?? .json, .json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        loadWorkspace(url: url)
+    }
+
+    func saveWorkspace(url: URL) throws {
+        let document = WorkspaceDocument(
+            samples: samples.map { sample in
+                WorkspaceSampleSnapshot(
+                    id: sample.id,
+                    name: sample.name,
+                    urlPath: sample.url?.path,
+                    kind: sample.kind,
+                    gates: sample.gates.map { WorkspaceGateSnapshot(node: $0) }
+                )
+            },
+            groupGates: groupGates.map { WorkspaceGateSnapshot(node: $0) },
+            layouts: layouts,
+            selectedLayoutID: selectedLayoutID
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(document)
+        try data.write(to: url, options: .atomic)
+    }
+
+    func loadWorkspace(url: URL) {
+        status = "Opening \(url.lastPathComponent)..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let data = try Data(contentsOf: url)
+                let document = try JSONDecoder().decode(WorkspaceDocument.self, from: data)
+                var loadedSamples: [WorkspaceSample] = []
+                var missingSamples: [String] = []
+
+                for sampleSnapshot in document.samples {
+                    guard let path = sampleSnapshot.urlPath else {
+                        missingSamples.append(sampleSnapshot.name)
+                        continue
+                    }
+                    let sampleURL = URL(fileURLWithPath: path)
+                    do {
+                        let table: EventTable
+                        switch sampleSnapshot.kind {
+                        case .fcs:
+                            table = try FCSParser.load(url: sampleURL).table
+                        case .singleCell:
+                            table = try SingleCellDataParser.load(url: sampleURL).table
+                        }
+                        let sample = WorkspaceSample(
+                            id: sampleSnapshot.id,
+                            name: sampleSnapshot.name,
+                            url: sampleURL,
+                            kind: sampleSnapshot.kind,
+                            table: table,
+                            gates: sampleSnapshot.gates.map { $0.node() }
+                        )
+                        loadedSamples.append(sample)
+                    } catch {
+                        missingSamples.append(sampleSnapshot.name)
+                    }
+                }
+
+                Task { @MainActor in
+                    self.groupGates = document.groupGates.map { $0.node() }
+                    self.samples = loadedSamples
+                    self.layouts = document.layouts.isEmpty ? [WorkspaceLayout(name: "Layout")] : document.layouts
+                    self.selectedLayoutID = document.selectedLayoutID ?? self.layouts.first?.id
+                    self.selected = self.samples.first.map { WorkspaceSelection(sampleID: $0.id, gateID: nil) }
+                    for sample in self.samples {
+                        self.refreshCounts(in: sample)
+                    }
+                    self.gateChangeVersion += 1
+                    if missingSamples.isEmpty {
+                        self.status = "Opened workspace \(url.lastPathComponent)."
+                    } else {
+                        self.status = "Opened workspace with \(missingSamples.count) missing sample reference\(missingSamples.count == 1 ? "" : "s")."
+                    }
+                }
+            } catch {
+                Task { @MainActor in
+                    self.status = "Could not open workspace: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func createGroup() {
@@ -221,11 +624,19 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func openTableEditor() {
-        let alert = NSAlert()
-        alert.messageText = "Table Editor"
-        alert.informativeText = "The workspace table is already editable for names, gates, counts, and drag-to-apply gate templates."
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        let root = TableEditorView(workspace: self)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "OpenFlo Tables"
+        window.center()
+        window.contentView = NSHostingView(rootView: root)
+        let controller = NSWindowController(window: window)
+        tableWindowControllers.append(controller)
+        controller.showWindow(nil)
     }
 
     func openPreferences() {
@@ -244,6 +655,27 @@ final class WorkspaceModel: ObservableObject {
         status = "Added \(layout.name)."
     }
 
+    func duplicateSelectedLayout() {
+        guard let layout = selectedLayout else { return }
+        var duplicate = layout
+        duplicate = WorkspaceLayout(
+            name: "\(layout.name) Copy",
+            items: layout.items,
+            zoom: layout.zoom,
+            showGrid: layout.showGrid,
+            showPageBreaks: layout.showPageBreaks,
+            iterationMode: layout.iterationMode,
+            iterationSampleID: layout.iterationSampleID,
+            batchDestination: layout.batchDestination,
+            batchAxis: layout.batchAxis,
+            batchCount: layout.batchCount,
+            batchAcross: layout.batchAcross
+        )
+        layouts.append(duplicate)
+        selectedLayoutID = duplicate.id
+        status = "Duplicated \(layout.name)."
+    }
+
     func deleteSelectedLayout() {
         guard layouts.count > 1 else {
             status = "Keep at least one layout."
@@ -255,6 +687,104 @@ final class WorkspaceModel: ObservableObject {
         layouts.remove(at: index)
         selectedLayoutID = layouts[min(index, layouts.count - 1)].id
         status = "Deleted \(deletedName)."
+    }
+
+    func renameSelectedLayout(to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let selectedLayoutID,
+              let index = layouts.firstIndex(where: { $0.id == selectedLayoutID }) else { return }
+        layouts[index].name = trimmed
+        status = "Renamed layout to \(trimmed)."
+    }
+
+    func addLayoutItem(_ item: WorkspaceLayoutItem) {
+        guard let index = selectedLayoutIndex else { return }
+        layouts[index].items.append(item)
+        status = "Added \(item.kind.displayName) to \(layouts[index].name)."
+    }
+
+    func updateLayoutItem(_ item: WorkspaceLayoutItem) {
+        guard let layoutIndex = selectedLayoutIndex,
+              let itemIndex = layouts[layoutIndex].items.firstIndex(where: { $0.id == item.id }) else { return }
+        layouts[layoutIndex].items[itemIndex] = item
+    }
+
+    func deleteLayoutItem(id: UUID) {
+        guard let layoutIndex = selectedLayoutIndex else { return }
+        layouts[layoutIndex].items.removeAll { $0.id == id }
+        status = "Deleted layout item."
+    }
+
+    func createBatchLayout(from layoutID: UUID) {
+        guard let source = layouts.first(where: { $0.id == layoutID }) else { return }
+        let samplesForBatch = samples
+        guard !samplesForBatch.isEmpty else {
+            status = "Load samples before creating a batch report."
+            return
+        }
+        let count = max(1, source.batchCount)
+        let columns = source.batchAxis == .columns ? count : max(1, Int(ceil(Double(samplesForBatch.count) / Double(count))))
+        let tileWidth = 300.0
+        let tileHeight = 260.0
+        var batchedItems: [WorkspaceLayoutItem] = []
+
+        for (sampleIndex, sample) in samplesForBatch.enumerated() {
+            let row: Int
+            let column: Int
+            if source.batchAxis == .columns {
+                column = source.batchAcross ? sampleIndex % columns : sampleIndex / max(1, count)
+                row = source.batchAcross ? sampleIndex / columns : sampleIndex % max(1, count)
+            } else {
+                row = source.batchAcross ? sampleIndex % count : sampleIndex / columns
+                column = source.batchAcross ? sampleIndex / count : sampleIndex % columns
+            }
+            let dx = Double(column) * (tileWidth + 36)
+            let dy = Double(row) * (tileHeight + 52)
+
+            for item in source.items {
+                var copy = item
+                copy.id = UUID()
+                copy.frame = LayoutFrame(
+                    x: 48 + dx + (item.frame.x - 72) * 0.72,
+                    y: 48 + dy + (item.frame.y - 72) * 0.72,
+                    width: item.frame.width * 0.72,
+                    height: item.frame.height * 0.72
+                )
+                if case .plot(var descriptor) = copy.kind {
+                    descriptor.sourceSelection = matchingSelection(for: descriptor, sampleID: sample.id)
+                        ?? WorkspaceSelection(sampleID: sample.id, gateID: nil)
+                    copy.kind = .plot(descriptor)
+                }
+                batchedItems.append(copy)
+            }
+
+            batchedItems.append(
+                WorkspaceLayoutItem(
+                    frame: LayoutFrame(x: 48 + dx, y: 48 + dy + tileHeight - 28, width: tileWidth, height: 28),
+                    kind: .text(sample.name),
+                    strokeColorName: "None",
+                    fillColorName: "None",
+                    lineWidth: 0
+                )
+            )
+        }
+
+        let batch = WorkspaceLayout(
+            name: "\(source.name)-Batch",
+            items: batchedItems,
+            zoom: source.zoom,
+            showGrid: source.showGrid,
+            showPageBreaks: source.showPageBreaks,
+            iterationMode: .off,
+            batchDestination: source.batchDestination,
+            batchAxis: source.batchAxis,
+            batchCount: source.batchCount,
+            batchAcross: source.batchAcross
+        )
+        layouts.append(batch)
+        selectedLayoutID = batch.id
+        status = "Created \(batch.name) with \(samplesForBatch.count) sample tile\(samplesForBatch.count == 1 ? "" : "s")."
     }
 
     func openLayoutEditor() {
@@ -273,6 +803,15 @@ final class WorkspaceModel: ObservableObject {
         controller.showWindow(nil)
     }
 
+    private var selectedLayoutIndex: Int? {
+        guard let selectedLayoutID else { return layouts.indices.first }
+        return layouts.firstIndex { $0.id == selectedLayoutID }
+    }
+
+    private var selectedLayout: WorkspaceLayout? {
+        selectedLayoutIndex.map { layouts[$0] }
+    }
+
     func addGateFromPlot(
         _ gate: PolygonGate,
         xChannelName: String,
@@ -288,7 +827,7 @@ final class WorkspaceModel: ObservableObject {
         let parentMask = parentMask(for: target, in: sample)
         let resolvedXSettings = xAxisSettings ?? AxisDisplaySettings(transform: xTransform)
         let resolvedYSettings = yAxisSettings ?? AxisDisplaySettings(transform: yTransform)
-        let count = evaluate(
+        let gateMask = evaluate(
             gate: gate,
             sample: sample,
             base: parentMask,
@@ -296,8 +835,8 @@ final class WorkspaceModel: ObservableObject {
             yChannelName: yChannelName,
             xAxisSettings: resolvedXSettings,
             yAxisSettings: resolvedYSettings
-        ).selectedCount
-        return insertGate(
+        )
+        let inserted = insertGate(
             gate,
             xChannelName: xChannelName,
             yChannelName: yChannelName,
@@ -305,10 +844,14 @@ final class WorkspaceModel: ObservableObject {
             yTransform: yTransform,
             xAxisSettings: resolvedXSettings,
             yAxisSettings: resolvedYSettings,
-            count: count,
+            count: gateMask.selectedCount,
             parentSelection: target,
             sample: sample
         )
+        if let gateID = inserted?.gateID {
+            storeGateMask(gateMask, sample: sample, gateID: gateID)
+        }
+        return inserted
     }
 
     private func insertGate(
@@ -476,11 +1019,21 @@ final class WorkspaceModel: ObservableObject {
 
     func dragPayload(for row: WorkspaceRow, selectedRows: [WorkspaceRow]) -> String? {
         let gateIDs = selectedRows.compactMap(\.selection.gateID)
-        guard row.isGate, !gateIDs.isEmpty else { return nil }
-        if gateIDs.count == 1, let gateID = gateIDs.first {
-            return "gate:\(gateID.uuidString)"
+        if row.isGate, !gateIDs.isEmpty {
+            if gateIDs.count == 1, let gateID = gateIDs.first {
+                return "gate:\(gateID.uuidString)"
+            }
+            return "gates:\(gateIDs.map(\.uuidString).joined(separator: ","))"
         }
-        return "gates:\(gateIDs.map(\.uuidString).joined(separator: ","))"
+
+        let sampleIDs = selectedRows
+            .filter { !$0.isGate && !$0.selection.isAllSamples }
+            .map(\.selection.sampleID)
+        guard !sampleIDs.isEmpty else { return nil }
+        if sampleIDs.count == 1, let sampleID = sampleIDs.first {
+            return "sample:\(sampleID.uuidString)"
+        }
+        return "samples:\(sampleIDs.map(\.uuidString).joined(separator: ","))"
     }
 
     func openPlotWindow(for selection: WorkspaceSelection) {
@@ -697,6 +1250,8 @@ final class WorkspaceModel: ObservableObject {
             objectWillChange.send()
             _ = removeGate(gateID, from: &groupGates)
             selected = nil
+            layoutPlotSnapshotCache.removeAll()
+            gateMaskCache.removeAll()
             gateChangeVersion += 1
             status = "Deleted all-samples gate."
             return
@@ -706,11 +1261,16 @@ final class WorkspaceModel: ObservableObject {
         if let gateID = selection.gateID {
             _ = removeGate(gateID, from: &samples[sampleIndex].gates)
             selected = WorkspaceSelection(sampleID: samples[sampleIndex].id, gateID: nil)
+            layoutPlotSnapshotCache.removeAll()
+            gateMaskCache.removeAll()
             gateChangeVersion += 1
             status = "Deleted gate."
         } else {
             samples.remove(at: sampleIndex)
             selected = samples.first.map { WorkspaceSelection(sampleID: $0.id, gateID: nil) }
+            lastCreatedGate = nil
+            layoutPlotSnapshotCache.removeAll()
+            gateMaskCache.removeAll()
             gateChangeVersion += 1
             status = "Removed sample."
         }
@@ -752,6 +1312,906 @@ final class WorkspaceModel: ObservableObject {
         return sampleID.uuidString
     }
 
+    func selections(fromDragPayload payload: String) -> [WorkspaceSelection] {
+        let gateSelections = gateIDs(fromDragPayload: payload).compactMap { selection(containingGateID: $0) }
+        if !gateSelections.isEmpty {
+            return gateSelections
+        }
+        return sampleIDs(fromDragPayload: payload).compactMap { sampleID in
+            guard sample(id: sampleID) != nil else { return nil }
+            return WorkspaceSelection(sampleID: sampleID, gateID: nil)
+        }
+    }
+
+    func tableColumns(fromDragPayload payload: String) -> [WorkspaceTableColumn] {
+        selections(fromDragPayload: payload).compactMap { selection in
+            let path = gatePathNames(for: selection)
+            let name = path.last ?? displayName(for: selection)
+            return WorkspaceTableColumn(
+                sourceSelection: selection,
+                gatePath: path,
+                name: name,
+                statistic: .count,
+                channelName: defaultStatisticChannelName(for: selection)
+            )
+        }
+    }
+
+    func plotDescriptors(fromDragPayload payload: String) -> [WorkspacePlotDescriptor] {
+        selections(fromDragPayload: payload).compactMap { selection in
+            guard let descriptor = plotDescriptor(for: selection) else { return nil }
+            return descriptor
+        }
+    }
+
+    func plotOverlayDescriptors(fromDragPayload payload: String, startingAt colorIndex: Int) -> [WorkspacePlotOverlayDescriptor] {
+        selections(fromDragPayload: payload).enumerated().compactMap { index, selection in
+            let path = gatePathNames(for: selection)
+            let samplePrefix = sampleName(for: selection.sampleID)
+            let population = path.last ?? displayName(for: selection)
+            return WorkspacePlotOverlayDescriptor(
+                sourceSelection: selection,
+                gatePath: path,
+                name: "\(samplePrefix) • \(population)",
+                colorName: layoutOverlayColorName(at: colorIndex + index)
+            )
+        }
+    }
+
+    func displayName(for selection: WorkspaceSelection) -> String {
+        if selection.isAllSamples {
+            guard let gateID = selection.gateID, let node = gate(id: gateID, in: groupGates) else {
+                return "All Samples"
+            }
+            return node.name
+        }
+        guard let sample = sample(id: selection.sampleID) else { return "Missing Sample" }
+        guard let gateID = selection.gateID else { return sample.name }
+        return gate(id: gateID, in: sample.gates)?.name ?? "Missing Gate"
+    }
+
+    func gatePathNames(for selection: WorkspaceSelection) -> [String] {
+        if selection.isAllSamples {
+            guard let gateID = selection.gateID, let path = gatePath(gateID, in: groupGates) else { return [] }
+            return path.map(\.name)
+        }
+        guard let sample = sample(id: selection.sampleID),
+              let gateID = selection.gateID,
+              let path = gatePath(gateID, in: sample.gates) else {
+            return []
+        }
+        return path.map(\.name)
+    }
+
+    func availableStatisticChannelNames(for selection: WorkspaceSelection? = nil) -> [String] {
+        let table = tableForSelection(selection)
+        guard let table else { return [] }
+        return table.channels.map(\.displayName)
+    }
+
+    func layoutChannelOptions(
+        for selection: WorkspaceSelection?,
+        including requestedNames: [String?],
+        limit: Int = 320
+    ) -> WorkspaceChannelOptions {
+        guard let table = tableForSelection(selection) else {
+            return WorkspaceChannelOptions(names: [], totalCount: 0, isLimited: false)
+        }
+        guard table.channelCount > limit else {
+            return WorkspaceChannelOptions(
+                names: table.channels.map(\.displayName),
+                totalCount: table.channelCount,
+                isLimited: false
+            )
+        }
+
+        var names: [String] = []
+        var seen = Set<String>()
+        func append(_ name: String?) {
+            guard let name, !name.isEmpty, !seen.contains(name) else { return }
+            names.append(name)
+            seen.insert(name)
+        }
+
+        for requestedName in requestedNames {
+            append(requestedName)
+        }
+
+        for name in signatureChannelNames(for: table) {
+            append(name)
+            guard names.count < limit else {
+                return WorkspaceChannelOptions(names: names, totalCount: table.channelCount, isLimited: true)
+            }
+        }
+
+        for channel in table.channels {
+            append(channel.displayName)
+            guard names.count < limit else { break }
+        }
+
+        return WorkspaceChannelOptions(names: names, totalCount: table.channelCount, isLimited: true)
+    }
+
+    func tableOutput(for columns: [WorkspaceTableColumn]) -> WorkspaceTableOutput {
+        let rows = samples.map { sample in
+            WorkspaceTableOutputRow(
+                sampleName: sample.name,
+                values: columns.map { tableValue(for: $0, sample: sample) }
+            )
+        }
+        return WorkspaceTableOutput(columns: columns, rows: rows)
+    }
+
+    func plotDescriptor(for selection: WorkspaceSelection) -> WorkspacePlotDescriptor? {
+        let gatePath = gatePathNames(for: selection)
+        let configuration = gateConfiguration(for: selection)
+        if selection.isAllSamples {
+            if let gateID = selection.gateID, gate(id: gateID, in: groupGates) == nil {
+                return nil
+            }
+        } else {
+            guard let sample = sample(id: selection.sampleID) else { return nil }
+            if let gateID = selection.gateID, gate(id: gateID, in: sample.gates) == nil {
+                return nil
+            }
+        }
+        return WorkspacePlotDescriptor(
+            sourceSelection: selection,
+            gatePath: gatePath,
+            name: displayName(for: selection),
+            xChannelName: configuration?.xChannelName,
+            yChannelName: configuration?.yChannelName,
+            plotMode: .pseudocolor
+        )
+    }
+
+    func matchingSelection(for descriptor: WorkspacePlotDescriptor, sampleID: UUID?) -> WorkspaceSelection? {
+        if let sampleID, let sample = sample(id: sampleID) {
+            if descriptor.gatePath.isEmpty {
+                return WorkspaceSelection(sampleID: sample.id, gateID: nil)
+            }
+            let gate = gateMatchingPath(descriptor.gatePath, in: sample.gates)
+            return WorkspaceSelection(sampleID: sample.id, gateID: gate?.id)
+        }
+        return descriptor.sourceSelection
+    }
+
+    func layoutPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
+        let cacheKey = layoutPlotSnapshotCacheKey(for: descriptor, iterationSampleID: iterationSampleID)
+        if let cached = layoutPlotSnapshotCache[cacheKey] {
+            return cached
+        }
+
+        let snapshot = uncachedLayoutPlotSnapshot(for: descriptor, iterationSampleID: iterationSampleID)
+        if let snapshot {
+            layoutPlotSnapshotCache[cacheKey] = snapshot
+        }
+        return snapshot
+    }
+
+    func cachedLayoutPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
+        layoutPlotSnapshotCache[layoutPlotSnapshotCacheKey(for: descriptor, iterationSampleID: iterationSampleID)]
+    }
+
+    func storeLayoutPlotSnapshot(_ snapshot: LayoutPlotSnapshot, for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) {
+        layoutPlotSnapshotCache[layoutPlotSnapshotCacheKey(for: descriptor, iterationSampleID: iterationSampleID)] = snapshot
+    }
+
+    func layoutPlotSnapshotRenderID(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> String {
+        layoutPlotSnapshotCacheKey(for: descriptor, iterationSampleID: iterationSampleID)
+    }
+
+    private func uncachedLayoutPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
+        if !descriptor.overlays.isEmpty {
+            return layoutOverlayPlotSnapshot(for: descriptor, iterationSampleID: iterationSampleID)
+        }
+
+        guard let payload = layoutPlotRenderPayload(for: descriptor, iterationSampleID: iterationSampleID) else {
+            return nil
+        }
+        return Self.renderLayoutPlotSnapshot(from: payload)
+    }
+
+    func layoutPlotRenderPayload(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotRenderPayload? {
+        guard descriptor.overlays.isEmpty else { return nil }
+        guard let selection = matchingSelection(
+            for: descriptor,
+            sampleID: descriptor.sourceSelection.isAllSamples ? iterationSampleID : iterationSampleID ?? descriptor.sourceSelection.sampleID
+        ) else {
+            return nil
+        }
+        guard let sample = sample(id: selection.sampleID) else { return nil }
+        let path = selection.gateID.flatMap { gatePath($0, in: sample.gates) } ?? []
+        let table = sample.table
+        let axes = AppModel.defaultAxisSelection(for: table)
+        let configuration = gateConfiguration(for: selection)
+        let xIndex = descriptor.xChannelName.flatMap { channelIndex(named: $0, in: table) }
+            ?? configuration.flatMap { channelIndex(named: $0.xChannelName, in: table) }
+            ?? axes.x
+        let yIndex = descriptor.yChannelName.flatMap { channelIndex(named: $0, in: table) }
+            ?? configuration.flatMap { channelIndex(named: $0.yChannelName, in: table) }
+            ?? axes.y
+        let xSettings = configuration?.xAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[xIndex]))
+        let ySettings = configuration?.yAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[yIndex]))
+        let gateSteps = path.map { node in
+            LayoutGateRenderStep(
+                gate: node.gate,
+                xIndex: channelIndex(named: node.xChannelName, in: table) ?? axes.x,
+                yIndex: channelIndex(named: node.yChannelName, in: table) ?? axes.y,
+                xAxisSettings: node.xAxisSettings,
+                yAxisSettings: node.yAxisSettings
+            )
+        }
+        let eventCount = path.last?.count ?? selection.gateID.flatMap { cachedGateMask(sample: sample, gateID: $0)?.selectedCount } ?? table.rowCount
+        let mask = selection.gateID.flatMap { cachedGateMask(sample: sample, gateID: $0) }
+
+        if sample.kind == .singleCell {
+            return sampledSingleCellLayoutPlotRenderPayload(
+                table: table,
+                mask: mask,
+                gateSteps: gateSteps,
+                sampleName: sample.name,
+                populationName: path.last?.name ?? sample.name,
+                eventCount: eventCount,
+                xIndex: xIndex,
+                yIndex: yIndex,
+                xAxisSettings: xSettings,
+                yAxisSettings: ySettings,
+                mode: descriptor.plotMode,
+                ancestry: path.map(\.name)
+            )
+        }
+
+        return LayoutPlotRenderPayload(
+            table: table,
+            sampleKind: sample.kind,
+            mask: mask,
+            gateSteps: gateSteps,
+            sampleName: sample.name,
+            populationName: path.last?.name ?? sample.name,
+            eventCount: eventCount,
+            xIndex: xIndex,
+            yIndex: yIndex,
+            xAxisSettings: xSettings,
+            yAxisSettings: ySettings,
+            mode: descriptor.plotMode,
+            ancestry: path.map(\.name)
+        )
+    }
+
+    private func sampledSingleCellLayoutPlotRenderPayload(
+        table: EventTable,
+        mask: EventMask?,
+        gateSteps: [LayoutGateRenderStep],
+        sampleName: String,
+        populationName: String,
+        eventCount: Int,
+        xIndex: Int,
+        yIndex: Int,
+        xAxisSettings: AxisDisplaySettings,
+        yAxisSettings: AxisDisplaySettings,
+        mode: PlotMode,
+        ancestry: [String]
+    ) -> LayoutPlotRenderPayload {
+        let maxRows = 4_000
+        let indices: [Int]
+        let previewMask: EventMask?
+
+        if let mask {
+            indices = Self.sampledIndices(rowCount: table.rowCount, mask: mask, maxRows: maxRows)
+            previewMask = nil
+        } else {
+            indices = Self.sampledIndices(rowCount: table.rowCount, mask: nil, maxRows: maxRows)
+            previewMask = Self.evaluateLayoutGateSteps(gateSteps, table: table, indices: indices)
+        }
+
+        let previewTable = EventTable(
+            channels: [table.channels[xIndex], table.channels[yIndex]],
+            columns: [
+                Self.sampledColumn(table, xIndex, indices: indices),
+                Self.sampledColumn(table, yIndex, indices: indices)
+            ]
+        )
+
+        return LayoutPlotRenderPayload(
+            table: previewTable,
+            sampleKind: .singleCell,
+            mask: previewMask,
+            gateSteps: [],
+            sampleName: sampleName,
+            populationName: populationName,
+            eventCount: eventCount,
+            xIndex: 0,
+            yIndex: 1,
+            xAxisSettings: xAxisSettings,
+            yAxisSettings: yAxisSettings,
+            mode: mode,
+            ancestry: ancestry
+        )
+    }
+
+    nonisolated static func renderLayoutPlotSnapshot(from payload: LayoutPlotRenderPayload) -> LayoutPlotSnapshot {
+        if payload.sampleKind == .singleCell {
+            return renderSampledSingleCellLayoutPlotSnapshot(from: payload)
+        }
+
+        let mask = payload.mask ?? evaluateLayoutGateSteps(payload.gateSteps, table: payload.table)
+        let xValues = applyTransform(payload.xAxisSettings, to: payload.table.column(payload.xIndex))
+        let yValues = applyTransform(payload.yAxisSettings, to: payload.table.column(payload.yIndex))
+        let xRange = payload.xAxisSettings.resolvedRange(auto: EventTable.range(values: xValues, mask: mask))
+        let yRange = payload.yAxisSettings.resolvedRange(auto: EventTable.range(values: yValues, mask: mask))
+        let mode = payload.mode
+        let image: NSImage
+
+        if mode.isOneDimensional {
+            let histogram = Histogram1D.build(values: xValues, mask: mask, width: 420, xRange: xRange)
+            if mode == .cdf {
+                image = CDFRenderer.image(from: histogram, yRange: 0...1)
+            } else {
+                image = HistogramRenderer.image(from: histogram, height: 420, yRange: AppModel.histogramPreviewRange(maxBin: histogram.maxBin))
+            }
+        } else if mode == .dot {
+            image = DotPlotRenderer.image(
+                xValues: xValues,
+                yValues: yValues,
+                mask: mask,
+                width: 420,
+                height: 420,
+                xRange: xRange,
+                yRange: yRange,
+                maxDots: 35_000
+            )
+        } else {
+            let histogram = Histogram2D.build(
+                xValues: xValues,
+                yValues: yValues,
+                mask: mask,
+                width: 420,
+                height: 420,
+                xRange: xRange,
+                yRange: yRange
+            )
+            switch mode {
+            case .contour:
+                image = DensityPlotRenderer.image(from: histogram, style: .contour, levelPercent: 5)
+            case .density:
+                image = DensityPlotRenderer.image(from: histogram, style: .density, levelPercent: 5)
+            case .zebra:
+                image = DensityPlotRenderer.image(from: histogram, style: .zebra, levelPercent: 5)
+            case .pseudocolor:
+                image = HeatmapRenderer.image(from: histogram)
+            case .heatmapStatistic:
+                image = DensityPlotRenderer.image(from: histogram, style: .heatmapStatistic, levelPercent: 5)
+            case .dot, .histogram, .cdf:
+                image = HeatmapRenderer.image(from: histogram)
+            }
+        }
+
+        return LayoutPlotSnapshot(
+            image: image,
+            sampleName: payload.sampleName,
+            populationName: payload.populationName,
+            eventCount: payload.eventCount,
+            xAxisTitle: payload.table.channels[payload.xIndex].displayName,
+            yAxisTitle: mode.isOneDimensional ? mode.rawValue : payload.table.channels[payload.yIndex].displayName,
+            ancestry: payload.ancestry,
+            legend: []
+        )
+    }
+
+    private nonisolated static func renderSampledSingleCellLayoutPlotSnapshot(from payload: LayoutPlotRenderPayload) -> LayoutPlotSnapshot {
+        let maxRows = 4_000
+        let indices: [Int]
+        let sampledMask: EventMask?
+
+        if let mask = payload.mask {
+            indices = sampledIndices(rowCount: payload.table.rowCount, mask: mask, maxRows: maxRows)
+            sampledMask = nil
+        } else {
+            indices = sampledIndices(rowCount: payload.table.rowCount, mask: nil, maxRows: maxRows)
+            sampledMask = evaluateLayoutGateSteps(payload.gateSteps, table: payload.table, indices: indices)
+        }
+
+        let xValues = applyTransform(payload.xAxisSettings, to: sampledColumn(payload.table, payload.xIndex, indices: indices))
+        let yValues = applyTransform(payload.yAxisSettings, to: sampledColumn(payload.table, payload.yIndex, indices: indices))
+        let xRange = payload.xAxisSettings.resolvedRange(auto: EventTable.range(values: xValues, mask: sampledMask))
+        let yRange = payload.yAxisSettings.resolvedRange(auto: EventTable.range(values: yValues, mask: sampledMask))
+        let mode = payload.mode
+        let image: NSImage
+
+        if mode.isOneDimensional {
+            let histogram = Histogram1D.build(values: xValues, mask: sampledMask, width: 420, xRange: xRange)
+            if mode == .cdf {
+                image = CDFRenderer.image(from: histogram, yRange: 0...1)
+            } else {
+                image = HistogramRenderer.image(from: histogram, height: 420, yRange: AppModel.histogramPreviewRange(maxBin: histogram.maxBin))
+            }
+        } else if mode == .dot {
+            image = DotPlotRenderer.image(
+                xValues: xValues,
+                yValues: yValues,
+                mask: sampledMask,
+                width: 420,
+                height: 420,
+                xRange: xRange,
+                yRange: yRange,
+                maxDots: maxRows
+            )
+        } else {
+            let histogram = Histogram2D.build(
+                xValues: xValues,
+                yValues: yValues,
+                mask: sampledMask,
+                width: 420,
+                height: 420,
+                xRange: xRange,
+                yRange: yRange
+            )
+            switch mode {
+            case .contour:
+                image = DensityPlotRenderer.image(from: histogram, style: .contour, levelPercent: 5)
+            case .density:
+                image = DensityPlotRenderer.image(from: histogram, style: .density, levelPercent: 5)
+            case .zebra:
+                image = DensityPlotRenderer.image(from: histogram, style: .zebra, levelPercent: 5)
+            case .pseudocolor:
+                image = HeatmapRenderer.image(from: histogram)
+            case .heatmapStatistic:
+                image = DensityPlotRenderer.image(from: histogram, style: .heatmapStatistic, levelPercent: 5)
+            case .dot, .histogram, .cdf:
+                image = HeatmapRenderer.image(from: histogram)
+            }
+        }
+
+        return LayoutPlotSnapshot(
+            image: image,
+            sampleName: payload.sampleName,
+            populationName: payload.populationName,
+            eventCount: payload.eventCount,
+            xAxisTitle: payload.table.channels[payload.xIndex].displayName,
+            yAxisTitle: mode.isOneDimensional ? mode.rawValue : payload.table.channels[payload.yIndex].displayName,
+            ancestry: payload.ancestry,
+            legend: []
+        )
+    }
+
+    private nonisolated static func sampledIndices(rowCount: Int, mask: EventMask?, maxRows: Int) -> [Int] {
+        guard rowCount > 0, maxRows > 0 else { return [] }
+        if let mask {
+            guard mask.count == rowCount else { return [] }
+            let selectedCount = mask.selectedCount
+            guard selectedCount > 0 else { return [] }
+            if selectedCount <= maxRows {
+                return sampledSelectedIndices(mask, selectedCount: selectedCount, maxRows: maxRows)
+            }
+
+            let rowStride = max(1, rowCount / maxRows)
+            var output: [Int] = []
+            output.reserveCapacity(maxRows)
+
+            for index in stride(from: 0, to: rowCount, by: rowStride) where mask[index] {
+                output.append(index)
+                if output.count >= maxRows {
+                    return output
+                }
+            }
+
+            if output.count >= maxRows / 2 {
+                return output
+            }
+            return sampledSelectedIndices(mask, selectedCount: selectedCount, maxRows: maxRows)
+        }
+
+        guard rowCount > maxRows else {
+            return Array(0..<rowCount)
+        }
+
+        let rowStride = max(1, rowCount / maxRows)
+        var output: [Int] = []
+        output.reserveCapacity(maxRows)
+
+        for index in stride(from: 0, to: rowCount, by: rowStride) {
+            output.append(index)
+            if output.count >= maxRows {
+                break
+            }
+        }
+        return output
+    }
+
+    private nonisolated static func sampledSelectedIndices(
+        _ mask: EventMask,
+        selectedCount: Int,
+        maxRows: Int
+    ) -> [Int] {
+        let selectedStride = max(1, selectedCount / maxRows)
+        var selectedOrdinal = 0
+        var output: [Int] = []
+        output.reserveCapacity(min(selectedCount, maxRows))
+
+        for wordIndex in mask.words.indices {
+            var word = mask.words[wordIndex]
+            while word != 0 {
+                let bitIndex = word.trailingZeroBitCount
+                let rowIndex = wordIndex * 64 + bitIndex
+                if rowIndex < mask.count, selectedOrdinal % selectedStride == 0 {
+                    output.append(rowIndex)
+                    if output.count >= maxRows {
+                        return output
+                    }
+                }
+                selectedOrdinal += 1
+                word &= word - 1
+            }
+        }
+
+        return output
+    }
+
+    private nonisolated static func sampledColumn(_ table: EventTable, _ channel: Int, indices: [Int]) -> [Float] {
+        let column = table.column(channel)
+        return indices.map { column[$0] }
+    }
+
+    private nonisolated static func evaluateLayoutGateSteps(
+        _ steps: [LayoutGateRenderStep],
+        table: EventTable,
+        indices: [Int]
+    ) -> EventMask? {
+        guard !steps.isEmpty else { return nil }
+        var mask: EventMask?
+        for step in steps {
+            let xValues = applyTransform(step.xAxisSettings, to: sampledColumn(table, step.xIndex, indices: indices))
+            let yValues = applyTransform(step.yAxisSettings, to: sampledColumn(table, step.yIndex, indices: indices))
+            mask = step.gate.evaluate(xValues: xValues, yValues: yValues, base: mask)
+        }
+        return mask
+    }
+
+    private nonisolated static func evaluateLayoutGateSteps(_ steps: [LayoutGateRenderStep], table: EventTable) -> EventMask? {
+        var mask: EventMask?
+        for step in steps {
+            let xValues = applyTransform(step.xAxisSettings, to: table.column(step.xIndex))
+            let yValues = applyTransform(step.yAxisSettings, to: table.column(step.yIndex))
+            mask = step.gate.evaluate(xValues: xValues, yValues: yValues, base: mask)
+        }
+        return mask
+    }
+
+    private func layoutPlotSnapshotCacheKey(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> String {
+        let resolvedSelection = matchingSelection(
+            for: descriptor,
+            sampleID: descriptor.sourceSelection.isAllSamples ? iterationSampleID : iterationSampleID ?? descriptor.sourceSelection.sampleID
+        )
+        let sampleFingerprint: String
+        if let resolvedSelection, let sample = sample(id: resolvedSelection.sampleID) {
+            sampleFingerprint = "\(sample.id.uuidString):\(sample.table.rowCount):\(sample.table.channelCount)"
+        } else {
+            sampleFingerprint = "no-sample"
+        }
+        let overlayKey = descriptor.overlays.map { overlay in
+            [
+                overlay.sourceSelection.sampleID.uuidString,
+                overlay.sourceSelection.gateID?.uuidString ?? "root",
+                overlay.name,
+                overlay.gatePath.joined(separator: ">"),
+                overlay.colorName
+            ].joined(separator: ":")
+        }.joined(separator: "|")
+        return [
+            "\(gateChangeVersion)",
+            sampleFingerprint,
+            iterationSampleID?.uuidString ?? "no-iteration",
+            descriptor.sourceSelection.sampleID.uuidString,
+            descriptor.sourceSelection.gateID?.uuidString ?? "root",
+            descriptor.name,
+            descriptor.gatePath.joined(separator: ">"),
+            descriptor.xChannelName ?? "auto-x",
+            descriptor.yChannelName ?? "auto-y",
+            descriptor.plotMode.rawValue,
+            overlayKey
+        ].joined(separator: "::")
+    }
+
+    private func layoutOverlayPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
+        guard let baseSelection = matchingSelection(
+            for: descriptor,
+            sampleID: descriptor.sourceSelection.isAllSamples ? iterationSampleID : nil
+        ),
+              let baseSample = sample(id: baseSelection.sampleID) else {
+            return nil
+        }
+
+        let baseTable = baseSample.table
+        let baseAxes = AppModel.defaultAxisSelection(for: baseTable)
+        let baseConfiguration = gateConfiguration(for: baseSelection)
+        let xChannelName = descriptor.xChannelName ?? baseConfiguration?.xChannelName ?? baseTable.channels[baseAxes.x].displayName
+        let yChannelName = descriptor.yChannelName ?? baseConfiguration?.yChannelName ?? baseTable.channels[baseAxes.y].displayName
+        let xSettings = baseConfiguration?.xAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: baseTable.channels[baseAxes.x]))
+        let ySettings = baseConfiguration?.yAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: baseTable.channels[baseAxes.y]))
+
+        var series: [OverlayDotPlotSeries] = []
+        var legend: [LayoutPlotLegendEntry] = []
+        var xRange: ClosedRange<Float>?
+        var yRange: ClosedRange<Float>?
+
+        func appendSeries(selection: WorkspaceSelection, name: String, colorName: String) {
+            guard let sample = sample(id: selection.sampleID) else { return }
+            if sample.kind == .singleCell {
+                let table = sample.table
+                let axes = AppModel.defaultAxisSelection(for: table)
+                let path = selection.gateID.flatMap { gatePath($0, in: sample.gates) } ?? []
+                let xIndex = channelIndex(named: xChannelName, in: table) ?? axes.x
+                let yIndex = channelIndex(named: yChannelName, in: table) ?? axes.y
+                let cachedMask = selection.gateID.flatMap { cachedGateMask(sample: sample, gateID: $0) }
+                let gateSteps = path.map { node in
+                    LayoutGateRenderStep(
+                        gate: node.gate,
+                        xIndex: channelIndex(named: node.xChannelName, in: table) ?? axes.x,
+                        yIndex: channelIndex(named: node.yChannelName, in: table) ?? axes.y,
+                        xAxisSettings: node.xAxisSettings,
+                        yAxisSettings: node.yAxisSettings
+                    )
+                }
+                let indices: [Int]
+                let previewMask: EventMask?
+                if let cachedMask {
+                    indices = Self.sampledIndices(rowCount: table.rowCount, mask: cachedMask, maxRows: 4_000)
+                    previewMask = nil
+                } else {
+                    indices = Self.sampledIndices(rowCount: table.rowCount, mask: nil, maxRows: 4_000)
+                    previewMask = Self.evaluateLayoutGateSteps(gateSteps, table: table, indices: indices)
+                }
+                let xValues = Self.applyTransform(xSettings, to: Self.sampledColumn(table, xIndex, indices: indices))
+                let yValues = Self.applyTransform(ySettings, to: Self.sampledColumn(table, yIndex, indices: indices))
+                xRange = union(xRange, EventTable.range(values: xValues, mask: previewMask))
+                yRange = union(yRange, EventTable.range(values: yValues, mask: previewMask))
+                series.append(
+                    OverlayDotPlotSeries(
+                        xValues: xValues,
+                        yValues: yValues,
+                        mask: previewMask,
+                        colorName: colorName
+                    )
+                )
+                legend.append(
+                    LayoutPlotLegendEntry(
+                        name: name,
+                        colorName: colorName,
+                        eventCount: path.last?.count ?? cachedMask?.selectedCount ?? table.rowCount
+                    )
+                )
+                return
+            }
+
+            guard let population = selectedPopulation(for: selection) else { return }
+            let axes = AppModel.defaultAxisSelection(for: population.table)
+            let xIndex = channelIndex(named: xChannelName, in: population.table) ?? axes.x
+            let yIndex = channelIndex(named: yChannelName, in: population.table) ?? axes.y
+            let xValues = Self.applyTransform(xSettings, to: population.table.column(xIndex))
+            let yValues = Self.applyTransform(ySettings, to: population.table.column(yIndex))
+            xRange = union(xRange, EventTable.range(values: xValues, mask: population.mask))
+            yRange = union(yRange, EventTable.range(values: yValues, mask: population.mask))
+            series.append(
+                OverlayDotPlotSeries(
+                    xValues: xValues,
+                    yValues: yValues,
+                    mask: population.mask,
+                    colorName: colorName
+                )
+            )
+            legend.append(
+                LayoutPlotLegendEntry(
+                    name: name,
+                    colorName: colorName,
+                    eventCount: population.mask?.selectedCount ?? population.table.rowCount
+                )
+            )
+        }
+
+        appendSeries(
+            selection: baseSelection,
+            name: "\(baseSample.name) • \(displayName(for: baseSelection))",
+            colorName: layoutOverlayColorName(at: 0)
+        )
+
+        for overlay in descriptor.overlays {
+            let overlaySelection = matchingSelection(for: overlay, iterationSampleID: iterationSampleID)
+            if let overlaySelection {
+                appendSeries(selection: overlaySelection, name: overlay.name, colorName: overlay.colorName)
+            }
+        }
+
+        guard !series.isEmpty else { return nil }
+        let resolvedXRange = xRange ?? 0...1
+        let resolvedYRange = yRange ?? 0...1
+        let image = OverlayDotPlotRenderer.image(
+            series: series,
+            width: 420,
+            height: 420,
+            xRange: resolvedXRange,
+            yRange: resolvedYRange
+        )
+
+        return LayoutPlotSnapshot(
+            image: image,
+            sampleName: "Overlay (\(legend.count) populations)",
+            populationName: descriptor.name,
+            eventCount: legend.reduce(0) { $0 + $1.eventCount },
+            xAxisTitle: xChannelName,
+            yAxisTitle: yChannelName,
+            ancestry: gatePathNames(for: baseSelection),
+            legend: legend
+        )
+    }
+
+    private func matchingSelection(for overlay: WorkspacePlotOverlayDescriptor, iterationSampleID: UUID?) -> WorkspaceSelection? {
+        if overlay.sourceSelection.isAllSamples, let iterationSampleID, let sample = sample(id: iterationSampleID) {
+            if overlay.gatePath.isEmpty {
+                return WorkspaceSelection(sampleID: sample.id, gateID: nil)
+            }
+            let gate = gateMatchingPath(overlay.gatePath, in: sample.gates)
+            return WorkspaceSelection(sampleID: sample.id, gateID: gate?.id)
+        }
+        return overlay.sourceSelection
+    }
+
+    private func union(_ lhs: ClosedRange<Float>?, _ rhs: ClosedRange<Float>) -> ClosedRange<Float> {
+        guard let lhs else { return rhs }
+        return min(lhs.lowerBound, rhs.lowerBound)...max(lhs.upperBound, rhs.upperBound)
+    }
+
+    func sampleName(for id: UUID?) -> String {
+        guard let id, let sample = sample(id: id) else { return "Off" }
+        return sample.name
+    }
+
+    private func gateIDs(fromDragPayload payload: String) -> [UUID] {
+        if payload.hasPrefix("gates:") {
+            return payload
+                .dropFirst(6)
+                .split(separator: ",")
+                .compactMap { UUID(uuidString: String($0)) }
+        }
+        if payload.hasPrefix("gate:"), let gateID = UUID(uuidString: String(payload.dropFirst(5))) {
+            return [gateID]
+        }
+        return []
+    }
+
+    private func sampleIDs(fromDragPayload payload: String) -> [UUID] {
+        if payload.hasPrefix("samples:") {
+            return payload
+                .dropFirst(8)
+                .split(separator: ",")
+                .compactMap { UUID(uuidString: String($0)) }
+        }
+        if payload.hasPrefix("sample:"), let sampleID = UUID(uuidString: String(payload.dropFirst(7))) {
+            return [sampleID]
+        }
+        return []
+    }
+
+    private func selection(containingGateID gateID: UUID) -> WorkspaceSelection? {
+        if gate(id: gateID, in: groupGates) != nil {
+            return WorkspaceSelection(sampleID: WorkspaceSelection.allSamplesID, gateID: gateID)
+        }
+        for sample in samples where gate(id: gateID, in: sample.gates) != nil {
+            return WorkspaceSelection(sampleID: sample.id, gateID: gateID)
+        }
+        return nil
+    }
+
+    private func defaultStatisticChannelName(for selection: WorkspaceSelection) -> String? {
+        if let configuration = gateConfiguration(for: selection) {
+            return configuration.xChannelName
+        }
+        let table = tableForSelection(selection)
+        guard let table else { return nil }
+        let axes = AppModel.defaultAxisSelection(for: table)
+        return table.channels[axes.x].displayName
+    }
+
+    private func tableValue(for column: WorkspaceTableColumn, sample: WorkspaceSample) -> Double? {
+        let path = column.gatePath.isEmpty ? [] : gatePathMatching(column.gatePath, in: sample.gates)
+        if !column.gatePath.isEmpty, path.isEmpty {
+            return nil
+        }
+        let mask = path.isEmpty
+            ? EventMask(count: sample.table.rowCount, fill: true)
+            : evaluate(path: path, sample: sample)
+        switch column.statistic {
+        case .count:
+            return Double(mask.selectedCount)
+        case .percentParent:
+            let parentCount = parentCount(for: path, sample: sample)
+            guard parentCount > 0 else { return nil }
+            return Double(mask.selectedCount) / Double(parentCount) * 100
+        case .percentTotal:
+            guard sample.table.rowCount > 0 else { return nil }
+            return Double(mask.selectedCount) / Double(sample.table.rowCount) * 100
+        case .median, .mean, .geometricMean:
+            guard let channelIndex = statisticChannelIndex(named: column.channelName, in: sample.table) else { return nil }
+            let values = selectedFiniteValues(sample.table.column(channelIndex), mask: mask)
+            guard !values.isEmpty else { return nil }
+            switch column.statistic {
+            case .median:
+                return Double(median(values))
+            case .mean:
+                return Double(values.reduce(Float(0), +) / Float(values.count))
+            case .geometricMean:
+                let positive = values.filter { $0 > 0 }
+                guard !positive.isEmpty else { return nil }
+                let logMean = positive.map { log(Double($0)) }.reduce(0, +) / Double(positive.count)
+                return exp(logMean)
+            case .count, .percentParent, .percentTotal:
+                return nil
+            }
+        }
+    }
+
+    private func gatePathMatching(_ names: [String], in gates: [WorkspaceGateNode]) -> [WorkspaceGateNode] {
+        guard let firstName = names.first else { return [] }
+        for gate in gates where gate.name == firstName {
+            if names.count == 1 {
+                return [gate]
+            }
+            let childPath = gatePathMatching(Array(names.dropFirst()), in: gate.children)
+            if !childPath.isEmpty {
+                return [gate] + childPath
+            }
+        }
+        return []
+    }
+
+    private func parentCount(for path: [WorkspaceGateNode], sample: WorkspaceSample) -> Int {
+        guard path.count > 1 else { return sample.table.rowCount }
+        return evaluate(path: Array(path.dropLast()), sample: sample).selectedCount
+    }
+
+    private func statisticChannelIndex(named name: String?, in table: EventTable) -> Int? {
+        if let name, let index = channelIndex(named: name, in: table) {
+            return index
+        }
+        if let name {
+            let normalizedName = normalizedChannelName(name)
+            if let index = table.channels.firstIndex(where: { normalizedChannelName($0.displayName) == normalizedName }) {
+                return index
+            }
+        }
+        return AppModel.defaultAxisSelection(for: table).x
+    }
+
+    private func selectedFiniteValues(_ values: [Float], mask: EventMask) -> [Float] {
+        guard mask.count == values.count else { return [] }
+        var output: [Float] = []
+        output.reserveCapacity(mask.selectedCount)
+        for index in values.indices where mask[index] {
+            let value = values[index]
+            if value.isFinite {
+                output.append(value)
+            }
+        }
+        return output
+    }
+
+    private func median(_ values: [Float]) -> Float {
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
+    }
+
+    private func tableForSelection(_ selection: WorkspaceSelection?) -> EventTable? {
+        guard let selection else { return samples.first?.table }
+        if selection.isAllSamples {
+            return samples.first?.table
+        }
+        return sample(id: selection.sampleID)?.table
+    }
+
     private func appendGateRows(
         _ gates: [WorkspaceGateNode],
         sampleID: UUID,
@@ -783,6 +2243,175 @@ final class WorkspaceModel: ObservableObject {
         samples.first { $0.id == id }
     }
 
+    private func beginProgress(title: String, detail: String, fraction: Double?) -> UUID {
+        let id = UUID()
+        activeProgressID = id
+        progress = WorkspaceProgress(title: title, detail: detail, fraction: fraction)
+        status = detail
+        return id
+    }
+
+    private func updateProgress(_ id: UUID, title: String, detail: String, fraction: Double?) {
+        guard activeProgressID == id else { return }
+        let resolvedFraction = fraction.map { min(max($0, 0), 1) }
+        progress = WorkspaceProgress(title: title, detail: detail, fraction: resolvedFraction)
+        status = detail
+    }
+
+    private func updateScoringProgress(
+        _ id: UUID,
+        sampleName: String,
+        progress scoringProgress: SeqtometryScoringProgress,
+        lowerBound: Double,
+        upperBound: Double
+    ) {
+        let fraction = lowerBound + scoringProgress.fractionCompleted * (upperBound - lowerBound)
+        let percent = Int((scoringProgress.fractionCompleted * 100).rounded())
+        updateProgress(
+            id,
+            title: "Computing Signatures",
+            detail: "Scoring \(scoringProgress.signatureCount) signature(s) for \(sampleName): \(scoringProgress.completedCells.formatted()) / \(scoringProgress.totalCells.formatted()) cells (\(percent)%)",
+            fraction: fraction
+        )
+    }
+
+    private func finishProgress(_ id: UUID, status: String) {
+        guard activeProgressID == id else { return }
+        progress = nil
+        activeProgressID = nil
+        self.status = status
+    }
+
+    private func mergeSignatures(_ signatures: [SeqtometrySignature]) {
+        for signature in signatures {
+            if let index = loadedSignatures.firstIndex(where: { $0.name == signature.name }) {
+                loadedSignatures[index] = signature
+            } else {
+                loadedSignatures.append(signature)
+            }
+        }
+    }
+
+    private func chooseSignaturesForSingleCellLoad(matrixURLs: [URL]) -> SignatureSelectionResult? {
+        SignatureSelectionDialog.present(
+            matrixURLs: matrixURLs,
+            sources: signatureSelectionSources()
+        )
+    }
+
+    private func signatureSelectionSources() -> [SignatureSelectionSource] {
+        var sources: [SignatureSelectionSource] = []
+
+        if !loadedSignatures.isEmpty {
+            sources.append(
+                SignatureSelectionSource(
+                    name: "Loaded signatures",
+                    signatures: loadedSignatures,
+                    isSelectedByDefault: true
+                )
+            )
+        }
+
+        if let pbmcSignatures = try? bundledSeqtometrySignatures() {
+            sources.append(
+                SignatureSelectionSource(
+                    name: "PBMC bundled signatures",
+                    signatures: pbmcSignatures,
+                    isSelectedByDefault: loadedSignatures.isEmpty
+                )
+            )
+        }
+
+        if let defaultSignatures = try? bundledDefaultImmuneSignatures() {
+            sources.append(
+                SignatureSelectionSource(
+                    name: "Default immune signatures",
+                    signatures: defaultSignatures,
+                    isSelectedByDefault: false
+                )
+            )
+        }
+
+        return sources
+    }
+
+    private func bundledSeqtometrySignatures() throws -> [SeqtometrySignature] {
+        guard let signatureURL = Bundle.main.url(
+            forResource: "SeqtometryPBMCSignatures",
+            withExtension: "tsv"
+        ) else {
+            throw SeqtometrySignatureError.noSignatures
+        }
+        return try SeqtometrySignatureParser.load(url: signatureURL)
+    }
+
+    private func bundledDefaultImmuneSignatures() throws -> [SeqtometrySignature] {
+        guard let signatureURL = Bundle.main.url(
+            forResource: "DefaultImmuneSignatures",
+            withExtension: "tsv"
+        ) else {
+            throw SeqtometrySignatureError.noSignatures
+        }
+        return try SeqtometrySignatureParser.load(url: signatureURL)
+    }
+
+    private func applySignaturesToSingleCellSamples(_ signatures: [SeqtometrySignature], sourceName: String) {
+        let targetSamples = samples.filter { $0.kind == .singleCell }
+        guard !targetSamples.isEmpty else {
+            status = "Loaded \(signatures.count) signature(s) from \(sourceName). Drop a single-cell matrix to score it."
+            return
+        }
+
+        status = "Applying \(signatures.count) Seqtometry signature(s) to \(targetSamples.count) sample(s)..."
+        for sample in targetSamples {
+            let sampleID = sample.id
+            let sampleName = sample.name
+            let table = sample.table
+            let progressID = beginProgress(
+                title: "Computing Signatures",
+                detail: "Scoring \(signatures.count) signature(s) for \(sampleName)",
+                fraction: 0
+            )
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let scoredTable = try SeqtometryScorer.tableByAppendingScores(
+                        to: table,
+                        signatures: signatures,
+                        progress: { progress in
+                            Task { @MainActor in
+                                self.updateScoringProgress(
+                                    progressID,
+                                    sampleName: sampleName,
+                                    progress: progress,
+                                    lowerBound: 0,
+                                    upperBound: 0.96
+                                )
+                            }
+                        }
+                    )
+                    Task { @MainActor in
+                        guard let target = self.sample(id: sampleID) else { return }
+                        self.gateMaskCache.removeAll()
+                        target.table = scoredTable
+                        self.refreshCounts(in: target)
+                        self.gateChangeVersion += 1
+                        self.finishProgress(progressID, status: "Applied \(signatures.count) signature score channel(s) from \(sourceName).")
+                    }
+                } catch {
+                    Task { @MainActor in
+                        self.finishProgress(progressID, status: "Could not apply \(sourceName) to \(sampleName): \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshCounts(in sample: WorkspaceSample) {
+        for gate in sample.gates {
+            refreshCounts(for: gate, in: sample)
+        }
+    }
+
     private func upsertGroupGate(_ source: WorkspaceGateNode, parentGateID: UUID?) -> WorkspaceGateNode {
         let siblings: [WorkspaceGateNode]
         if let parentGateID, let parent = gate(id: parentGateID, in: groupGates) {
@@ -807,6 +2436,7 @@ final class WorkspaceModel: ObservableObject {
         guard !groupGates.isEmpty else { return }
         for sample in samples {
             for template in groupGates {
+                guard templateTree(template, isCompatibleWith: sample.table) else { continue }
                 let node = upsertTemplate(template, into: &sample.gates)
                 refreshCounts(for: node, in: sample)
             }
@@ -817,6 +2447,7 @@ final class WorkspaceModel: ObservableObject {
         for template in templates {
             guard let templatePath = gatePath(template.id, in: groupGates), !templatePath.isEmpty else { continue }
             for sample in samples {
+                guard templatePath.allSatisfy({ templateTree($0, isCompatibleWith: sample.table) }) else { continue }
                 _ = upsertTemplatePath(templatePath, into: &sample.gates)
                 if let rootTemplate = templatePath.first,
                    let rootGate = gateMatchingPath([rootTemplate.name], in: sample.gates) {
@@ -839,6 +2470,12 @@ final class WorkspaceModel: ObservableObject {
         clearCounts(in: node)
         siblings.append(node)
         return node
+    }
+
+    private func templateTree(_ node: WorkspaceGateNode, isCompatibleWith table: EventTable) -> Bool {
+        channelIndex(named: node.xChannelName, in: table) != nil
+            && channelIndex(named: node.yChannelName, in: table) != nil
+            && node.children.allSatisfy { templateTree($0, isCompatibleWith: table) }
     }
 
     private func upsertTemplatePath(_ path: [WorkspaceGateNode], into siblings: inout [WorkspaceGateNode]) -> WorkspaceGateNode? {
@@ -1006,8 +2643,24 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func evaluate(path: [WorkspaceGateNode], sample: WorkspaceSample) -> EventMask {
+        guard let lastGate = path.last else {
+            return EventMask(count: sample.table.rowCount, fill: true)
+        }
+        if let cached = cachedGateMask(sample: sample, gateID: lastGate.id) {
+            return cached
+        }
+
         var mask: EventMask?
-        for node in path {
+        var startIndex = path.startIndex
+        for index in path.indices.reversed() {
+            if let cached = cachedGateMask(sample: sample, gateID: path[index].id) {
+                mask = cached
+                startIndex = path.index(after: index)
+                break
+            }
+        }
+
+        for node in path[startIndex...] {
             mask = evaluate(
                 gate: node.gate,
                 sample: sample,
@@ -1017,8 +2670,28 @@ final class WorkspaceModel: ObservableObject {
                 xAxisSettings: node.xAxisSettings,
                 yAxisSettings: node.yAxisSettings
             )
+            if let mask {
+                storeGateMask(mask, sample: sample, gateID: node.id)
+            }
         }
         return mask ?? EventMask(count: sample.table.rowCount, fill: true)
+    }
+
+    private func cachedGateMask(sample: WorkspaceSample, gateID: UUID) -> EventMask? {
+        gateMaskCache[gateMaskCacheKey(sample: sample, gateID: gateID)]
+    }
+
+    private func storeGateMask(_ mask: EventMask, sample: WorkspaceSample, gateID: UUID) {
+        gateMaskCache[gateMaskCacheKey(sample: sample, gateID: gateID)] = mask
+    }
+
+    private func gateMaskCacheKey(sample: WorkspaceSample, gateID: UUID) -> String {
+        [
+            sample.id.uuidString,
+            gateID.uuidString,
+            "\(sample.table.rowCount)",
+            "\(sample.table.channelCount)"
+        ].joined(separator: "::")
     }
 
     private func parentMask(for selection: WorkspaceSelection, in sample: WorkspaceSample) -> EventMask? {
@@ -1119,13 +2792,48 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func channelIndex(named name: String, in table: EventTable) -> Int? {
-        let normalizedName = normalizedChannelName(name)
-        return table.channels.firstIndex { channel in
-            channel.name == name
-                || channel.displayName == name
-                || normalizedChannelName(channel.name) == normalizedName
-                || normalizedChannelName(channel.displayName) == normalizedName
+        let lookup = channelIndexLookup(for: table)
+        if let exact = lookup[name] {
+            return exact
         }
+        return lookup[normalizedChannelName(name)]
+    }
+
+    private func channelIndexLookup(for table: EventTable) -> [String: Int] {
+        let key = ObjectIdentifier(table)
+        if let cached = channelIndexLookupCache[key] {
+            return cached
+        }
+
+        var lookup: [String: Int] = [:]
+        lookup.reserveCapacity(table.channelCount * 3)
+
+        func insert(_ name: String, index: Int) {
+            guard !name.isEmpty, lookup[name] == nil else { return }
+            lookup[name] = index
+        }
+
+        for (index, channel) in table.channels.enumerated() {
+            insert(channel.name, index: index)
+            insert(channel.displayName, index: index)
+            insert(normalizedChannelName(channel.name), index: index)
+            insert(normalizedChannelName(channel.displayName), index: index)
+        }
+
+        channelIndexLookupCache[key] = lookup
+        return lookup
+    }
+
+    private func signatureChannelNames(for table: EventTable) -> [String] {
+        let key = ObjectIdentifier(table)
+        if let cached = signatureChannelNameCache[key] {
+            return cached
+        }
+        let names = table.channels.compactMap { channel in
+            channel.kind == .seqtometrySignature ? channel.displayName : nil
+        }
+        signatureChannelNameCache[key] = names
+        return names
     }
 
     private func channelNamesMatch(_ lhs: String, _ rhs: String) -> Bool {

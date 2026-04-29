@@ -1,6 +1,6 @@
 import Foundation
 
-public struct PlotPoint: Equatable, Sendable {
+public struct PlotPoint: Codable, Equatable, Sendable {
     public let x: Float
     public let y: Float
 
@@ -10,7 +10,7 @@ public struct PlotPoint: Equatable, Sendable {
     }
 }
 
-public enum GateKind: String, Equatable, Sendable {
+public enum GateKind: String, Codable, Equatable, Sendable {
     case polygon
     case rectangle
     case ellipse
@@ -18,7 +18,7 @@ public enum GateKind: String, Equatable, Sendable {
     case quadrant
 }
 
-public struct PolygonGate: Equatable, Sendable {
+public struct PolygonGate: Codable, Equatable, Sendable {
     public let name: String
     public let vertices: [PlotPoint]
     public let kind: GateKind
@@ -124,7 +124,8 @@ public struct PolygonGate: Equatable, Sendable {
         let wordCount = (eventCount + 63) / 64
         guard wordCount > 0 else { return EventMask(count: 0) }
 
-        let workers = max(1, min(ProcessInfo.processInfo.activeProcessorCount, wordCount))
+        let availableWorkers = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+        let workers = max(1, min(4, availableWorkers, wordCount))
         let group = DispatchGroup()
         let queue = DispatchQueue.global(qos: .userInitiated)
         final class PartialStore: @unchecked Sendable {
