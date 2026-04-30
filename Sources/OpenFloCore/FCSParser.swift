@@ -40,6 +40,7 @@ public struct FCSMetadata: Equatable, Sendable {
 public struct FCSFile: Sendable {
     public let metadata: FCSMetadata
     public let table: EventTable
+    public let acquisitionCompensation: CompensationMatrix?
 }
 
 public enum FCSParser {
@@ -104,8 +105,18 @@ public enum FCSParser {
             throw FCSParserError.unsupportedDataType(dataType)
         }
 
+        let metadata = FCSMetadata(version: version, keywords: keywords)
+        let acquisitionCompensation =
+            parseSpilloverKeyword(keywordValue("$SPILLOVER", in: keywords), keyword: "$SPILLOVER", channels: channels)
+            ?? parseSpilloverKeyword(keywordValue("$SPILL", in: keywords), keyword: "$SPILL", channels: channels)
+            ?? parseCompKeywordIfRecognized(keywordValue("$COMP", in: keywords), channels: channels)
+
         let table = EventTable(channels: channels, columns: columns)
-        return FCSFile(metadata: FCSMetadata(version: version, keywords: keywords), table: table)
+        return FCSFile(
+            metadata: metadata,
+            table: table,
+            acquisitionCompensation: acquisitionCompensation
+        )
     }
 
     public static func parseTextSegment(_ data: Data) throws -> [String: String] {
@@ -147,6 +158,103 @@ public enum FCSParser {
             tokenIndex += 2
         }
         return result
+    }
+
+    public static func parseSpilloverKeyword(_ value: String?, keyword: String, channels: [Channel]) -> CompensationMatrix? {
+        guard let value else { return nil }
+        let tokens = csvTokens(from: value)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let countToken = tokens.first,
+              let count = Int(countToken),
+              count > 0,
+              tokens.count == 1 + count + count * count else {
+            return nil
+        }
+
+        let parameters = Array(tokens[1...(count)])
+
+        let numericTokens = tokens[(1 + count)...]
+        var flatValues: [Double] = []
+        flatValues.reserveCapacity(count * count)
+        for token in numericTokens {
+            guard let value = Double(token), value.isFinite else { return nil }
+            flatValues.append(value)
+        }
+
+        let rows = stride(from: 0, to: flatValues.count, by: count).map { start in
+            Array(flatValues[start..<(start + count)])
+        }
+        let percent = normalizeToPercent(rows)
+        return CompensationMatrix(
+            name: "Acquisition-defined",
+            parameters: parameters,
+            percent: percent,
+            source: .acquisition(keyword: keyword),
+            colorHex: "#8E8E93",
+            locked: true
+        )
+    }
+
+    private static func parseCompKeywordIfRecognized(_ value: String?, channels: [Channel]) -> CompensationMatrix? {
+        guard let matrix = parseSpilloverKeyword(value, keyword: "$COMP", channels: channels) else {
+            return nil
+        }
+        return matrix
+    }
+
+    public static func normalizeToPercent(_ matrix: [[Double]]) -> [[Double]] {
+        let diagonal = matrix.indices.compactMap { index -> Double? in
+            guard matrix[index].indices.contains(index) else { return nil }
+            return abs(matrix[index][index])
+        }
+        let medianDiagonal = median(diagonal)
+        if medianDiagonal > 0.5, medianDiagonal < 2.0 {
+            return matrix.map { row in row.map { $0 * 100.0 } }
+        }
+        return matrix
+    }
+
+    private static func csvTokens(from value: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var index = value.startIndex
+        var isQuoted = false
+
+        while index < value.endIndex {
+            let character = value[index]
+            if character == "\"" {
+                let next = value.index(after: index)
+                if isQuoted, next < value.endIndex, value[next] == "\"" {
+                    current.append(character)
+                    index = value.index(after: next)
+                    continue
+                }
+                isQuoted.toggle()
+                index = next
+                continue
+            }
+            if character == ",", !isQuoted {
+                tokens.append(current)
+                current.removeAll(keepingCapacity: true)
+            } else {
+                current.append(character)
+            }
+            index = value.index(after: index)
+        }
+
+        tokens.append(current)
+        return tokens
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
     }
 
     private static func parseFloats(segment: Data.SubSequence, eventCount: Int, parameterCount: Int, littleEndian: Bool) throws -> [[Float]] {
@@ -211,6 +319,10 @@ public enum FCSParser {
     private static func required(_ key: String, _ keywords: [String: String]) throws -> String {
         guard let value = keywords[key] else { throw FCSParserError.missingKeyword(key) }
         return value
+    }
+
+    private static func keywordValue(_ key: String, in keywords: [String: String]) -> String? {
+        keywords[key] ?? keywords[String(key.dropFirst(key.first == "$" ? 1 : 0))]
     }
 
     private static func isLittleEndian(_ byteOrder: String) throws -> Bool {

@@ -20,7 +20,7 @@ struct ContentView: View {
             }
             workspacePane
         }
-        .frame(minWidth: 760, minHeight: 520)
+        .frame(minWidth: 940, minHeight: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             syncSelectionFromWorkspace()
@@ -59,6 +59,11 @@ struct ContentView: View {
                     .frame(height: 156)
 
                 navigateRibbonGroup
+
+                Divider()
+                    .frame(height: 156)
+
+                toolsRibbonGroup
 
                 Divider()
                     .frame(height: 156)
@@ -122,11 +127,11 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 0) {
-                    WorkspaceRibbonButton(title: "Table Editor", systemImage: "tablecells") {
+                    WorkspaceRibbonButton(title: "Table Editor", systemImage: "tablecells", width: 142) {
                         workspace.openTableEditor()
                     }
 
-                    WorkspaceRibbonButton(title: "Create Group...", systemImage: "curlybraces") {
+                    WorkspaceRibbonButton(title: "Create Group...", systemImage: "curlybraces", width: 142) {
                         workspace.createGroup()
                     }
                 }
@@ -138,6 +143,26 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
         }
         .frame(width: 430)
+    }
+
+    private var toolsRibbonGroup: some View {
+        VStack(spacing: 4) {
+            HStack(alignment: .top, spacing: 8) {
+                WorkspaceRibbonTallButton(
+                    title: "Edit Compensation Matrix",
+                    systemImage: "square.grid.3x3"
+                ) {
+                    openToolsCompensationEditor()
+                }
+                .disabled(!canEditCompensationMatrix)
+            }
+
+            Text("Tools")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+        }
+        .frame(width: 156)
     }
 
     private var editRibbonGroup: some View {
@@ -182,6 +207,12 @@ struct ContentView: View {
                         onCommitRename: {
                             workspace.rename(row.selection, to: editName)
                             editingRowID = nil
+                        },
+                        onCompensationDoubleClick: {
+                            workspace.openCompensationEditor(for: row.selection)
+                        },
+                        compensationDragProvider: {
+                            compensationItemProvider(for: row)
                         }
                     )
                     .tag(row.id)
@@ -203,6 +234,7 @@ struct ContentView: View {
                         } label: {
                             Text("Delete")
                         }
+                        compensationContextMenuItems(for: row)
                     }
                     .onDrag {
                         if let payload = workspace.dragPayload(for: row, selectedRows: selectedRowsForDrag(startingAt: row)) {
@@ -271,6 +303,8 @@ struct ContentView: View {
                 handleGateDrop(providers, target: .allSamples)
             }
 
+            compensationGroupRow
+
             ForEach(workspace.groupRows) { row in
                 WorkspaceRowView(
                     row: row,
@@ -279,6 +313,12 @@ struct ContentView: View {
                     onCommitRename: {
                         workspace.rename(row.selection, to: editName)
                         editingRowID = nil
+                    },
+                    onCompensationDoubleClick: {
+                        workspace.openCompensationEditor(for: row.selection)
+                    },
+                    compensationDragProvider: {
+                        compensationItemProvider(for: row)
                     }
                 )
                 .contentShape(Rectangle())
@@ -296,6 +336,7 @@ struct ContentView: View {
                     } label: {
                         Text("Delete")
                     }
+                    compensationContextMenuItems(for: row)
                 }
                 .onDrag {
                     if let payload = workspace.dragPayload(for: row, selectedRows: selectedRowsForDrag(startingAt: row)) {
@@ -307,6 +348,43 @@ struct ContentView: View {
                     handleGateDrop(providers, target: row.selection)
                 }
             }
+        }
+    }
+
+    private var compensationGroupRow: some View {
+        HStack {
+            Image(systemName: "square.grid.3x3")
+                .foregroundStyle(.gray)
+                .frame(width: 18)
+            Text("Compensation")
+                .fontWeight(.semibold)
+                .foregroundStyle(.red)
+            Spacer()
+            Text("\(workspace.compensationGroupSampleCount)")
+                .frame(width: 64, alignment: .trailing)
+            Text("Compensation")
+                .frame(width: 110, alignment: .trailing)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 32)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            workspace.openExistingCompensationForEditing(for: workspace.selected ?? .allSamples)
+        }
+        .contextMenu {
+            Button("Edit Compensation Matrix") {
+                workspace.openExistingCompensationForEditing(for: workspace.selected ?? .allSamples)
+            }
+            Button("Apply Selected Matrix to All Samples") {
+                if let matrixID = workspace.compensationMatrices.first?.id {
+                    workspace.assignCompensationToAllCompatible(matrixID)
+                }
+            }
+            .disabled(workspace.compensationMatrices.isEmpty)
+        }
+        .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
+            handleGateDrop(providers, target: .allSamples)
         }
     }
 
@@ -333,6 +411,10 @@ struct ContentView: View {
             return row
         }
         return allRows.first { selectedRowIDs.contains($0.id) }
+    }
+
+    private var canEditCompensationMatrix: Bool {
+        workspace.canEditExistingCompensation(for: currentRow?.selection)
     }
 
     private var allRows: [WorkspaceRow] {
@@ -536,6 +618,15 @@ struct ContentView: View {
         return row.isGate || !row.selection.isAllSamples ? [row] : []
     }
 
+    private func openToolsCompensationEditor() {
+        if let row = currentRow, !row.selection.isAllSamples {
+            selectOnly(row)
+            workspace.openExistingCompensationForEditing(for: row.selection)
+        } else {
+            workspace.openExistingCompensationForEditing(for: currentRow?.selection ?? workspace.selected ?? .allSamples)
+        }
+    }
+
     private func handleGateDrop(_ providers: [NSItemProvider], target: WorkspaceSelection) -> Bool {
         for provider in providers {
             provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
@@ -548,6 +639,39 @@ struct ContentView: View {
             }
         }
         return true
+    }
+
+    private func compensationItemProvider(for row: WorkspaceRow) -> NSItemProvider {
+        guard let matrixID = row.compensationBadge?.matrixID else { return NSItemProvider() }
+        return gateItemProvider(workspace.compensationDragPayload(matrixID: matrixID))
+    }
+
+    @ViewBuilder
+    private func compensationContextMenuItems(for row: WorkspaceRow) -> some View {
+        if !row.isGate, !row.selection.isAllSamples {
+            Divider()
+            Button("View Matrix") {
+                workspace.openCompensationEditor(for: row.selection)
+            }
+            .disabled(!workspace.hasCompensationMatrix(for: row.selection))
+
+            Button("Edit Compensation Matrix") {
+                workspace.editCompensationCopy(for: row.selection)
+            }
+            .disabled(!workspace.hasCompensationMatrix(for: row.selection))
+
+            Button("Apply Acquisition Matrix") {
+                workspace.applyAcquisitionCompensation(for: row.selection)
+            }
+
+            Button("Show Uncompensated") {
+                do {
+                    try workspace.assignCompensation(nil, to: row.selection.sampleID)
+                } catch {
+                    workspace.openCompensationEditor(for: row.selection)
+                }
+            }
+        }
     }
 }
 
@@ -735,12 +859,22 @@ private struct WorkspaceRowView: View {
     let isEditing: Bool
     @Binding var editName: String
     let onCommitRename: () -> Void
+    let onCompensationDoubleClick: () -> Void
+    let compensationDragProvider: () -> NSItemProvider
 
     var body: some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
                 Spacer()
                     .frame(width: CGFloat(row.depth) * 18)
+                if let badge = row.compensationBadge {
+                    CompensationBadgeView(badge: badge)
+                        .onTapGesture(count: 2, perform: onCompensationDoubleClick)
+                        .onDrag(compensationDragProvider)
+                } else if !row.isGate {
+                    Color.clear
+                        .frame(width: 16, height: 16)
+                }
                 Image(systemName: row.isGate ? "skew" : row.role == "Cells" ? "tablecells" : "doc")
                     .foregroundStyle(row.isGate ? .orange : .blue)
                 if isEditing {
@@ -766,6 +900,53 @@ private struct WorkspaceRowView: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
     }
+}
+
+private struct CompensationBadgeView: View {
+    let badge: WorkspaceCompensationBadge
+
+    var body: some View {
+        Image(systemName: symbolName)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(foreground)
+            .frame(width: 16, height: 16)
+            .help(badge.tooltip)
+            .accessibilityLabel(badge.tooltip)
+    }
+
+    private var symbolName: String {
+        switch badge.style {
+        case .assignedAcquisition, .assignedUser:
+            return "square.grid.3x3.fill"
+        case .available:
+            return "square.grid.3x3"
+        case .error:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var foreground: Color {
+        switch badge.style {
+        case .assignedAcquisition:
+            return .gray
+        case .assignedUser:
+            return colorFromHex(badge.colorHex) ?? .teal
+        case .available:
+            return .secondary
+        case .error:
+            return .orange
+        }
+    }
+}
+
+func colorFromHex(_ hex: String?) -> Color? {
+    guard let hex else { return nil }
+    let trimmed = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+    guard trimmed.count == 6, let value = UInt32(trimmed, radix: 16) else { return nil }
+    let red = Double((value >> 16) & 0xff) / 255.0
+    let green = Double((value >> 8) & 0xff) / 255.0
+    let blue = Double(value & 0xff) / 255.0
+    return Color(red: red, green: green, blue: blue)
 }
 
 private struct WorkspaceRibbonButton: View {
@@ -830,6 +1011,45 @@ private struct WorkspaceRibbonIconButton: View {
                         .fill(isHovering && isEnabled ? Color.accentColor.opacity(0.12) : Color.clear)
                 )
                 .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+private struct WorkspaceRibbonTallButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 7) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 36, weight: .medium))
+                    .foregroundStyle(isEnabled ? Color.teal : Color.secondary)
+                    .frame(height: 42)
+
+                Text(title)
+                    .font(.callout)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
+            }
+            .padding(.horizontal, 8)
+            .frame(width: 144, height: 126)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isHovering && isEnabled ? Color.accentColor.opacity(0.12) : Color.clear)
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(title)

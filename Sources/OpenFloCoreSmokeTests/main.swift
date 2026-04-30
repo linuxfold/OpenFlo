@@ -118,6 +118,120 @@ func testFCSMarkerFluorochromeLabels() throws {
     expect(channel.displayName == "CD86 (AF647)", "display name should combine marker and fluorochrome")
 }
 
+func testSpilloverParserNormalizesFractionsToPercent() throws {
+    let channels = ["FITC-A", "PE-A"].map { Channel(name: $0) }
+    let matrix = FCSParser.parseSpilloverKeyword(
+        "2,FITC-A,PE-A,1,0.10,0,1",
+        keyword: "$SPILL",
+        channels: channels
+    )
+
+    expect(matrix?.parameters == ["FITC-A", "PE-A"], "$SPILL parser should preserve parameter order")
+    expect(matrix?.percent[0][0] == 100, "fractional diagonal should normalize to 100 percent")
+    expect(abs((matrix?.percent[0][1] ?? 0) - 10) < 0.0001, "fractional spillover should normalize to percent")
+}
+
+func testSpilloverParserKeepsPercentUnits() throws {
+    let channels = ["FITC-A", "PE-A"].map { Channel(name: $0) }
+    let matrix = FCSParser.parseSpilloverKeyword(
+        "2,FITC-A,PE-A,100,16.3,0,100",
+        keyword: "$SPILLOVER",
+        channels: channels
+    )
+
+    expect(matrix?.percent[0][0] == 100, "percent diagonal should remain 100")
+    expect(abs((matrix?.percent[0][1] ?? 0) - 16.3) < 0.0001, "percent spillover should remain unchanged")
+}
+
+func testFCSParserReadsSpillWithoutDollarPrefix() throws {
+    let file = try FCSParser.parse(
+        data: singleFloatFCS(
+            value: 42.25,
+            byteOrder: "1,2,3,4",
+            parameterName: "FITC-A",
+            extraText: "/SPILL/1,FITC-A,1"
+        )
+    )
+
+    expect(file.acquisitionCompensation?.parameters == ["FITC-A"], "FCS parser should read SPILL without a dollar prefix")
+    expect(file.acquisitionCompensation?.percent == [[100]], "SPILL fraction values should normalize to percent")
+}
+
+func testSpilloverParserPreservesUnmatchedParameters() throws {
+    let matrix = FCSParser.parseSpilloverKeyword(
+        "2,FITC-A,PE-A,1,0.1,0,1",
+        keyword: "SPILL",
+        channels: [Channel(name: "FITC-A")]
+    )
+
+    expect(matrix?.parameters == ["FITC-A", "PE-A"], "parser should preserve acquisition matrix names even before matching sample channels")
+}
+
+func testCompensationIdentityLeavesValuesUnchanged() throws {
+    let table = EventTable(
+        channels: [Channel(name: "FITC-A"), Channel(name: "PE-A")],
+        columns: [[10, 20, 30], [2, 4, 6]]
+    )
+    let matrix = CompensationMatrix.identity(name: "Identity", parameters: ["FITC-A", "PE-A"])
+    let compensated = try CompensationEngine.apply(matrix, to: table)
+
+    expect(compensated.column(0) == table.column(0), "identity compensation should keep first channel unchanged")
+    expect(compensated.column(1) == table.column(1), "identity compensation should keep second channel unchanged")
+}
+
+func testCompensationTwoChannelSpill() throws {
+    let table = EventTable(
+        channels: [Channel(name: "FITC-A"), Channel(name: "PE-A")],
+        columns: [[1000], [100]]
+    )
+    let matrix = CompensationMatrix(
+        name: "FITC into PE",
+        parameters: ["FITC-A", "PE-A"],
+        percent: [
+            [100, 10],
+            [0, 100]
+        ],
+        source: .manualIdentity
+    )
+    let compensated = try CompensationEngine.apply(matrix, to: table)
+
+    expect(abs(compensated.value(event: 0, channel: 0) - 1000) < 0.001, "FITC should stay at 1000")
+    expect(abs(compensated.value(event: 0, channel: 1)) < 0.001, "PE should compensate FITC spillover to zero")
+}
+
+func testCompensationLeavesUnlistedChannelsUnchanged() throws {
+    let table = EventTable(
+        channels: [Channel(name: "FSC-A"), Channel(name: "FITC-A"), Channel(name: "PE-A"), Channel(name: "Time")],
+        columns: [[1, 2], [1000, 500], [100, 50], [9, 10]]
+    )
+    let matrix = CompensationMatrix(
+        name: "FITC into PE",
+        parameters: ["FITC-A", "PE-A"],
+        percent: [
+            [100, 10],
+            [0, 100]
+        ],
+        source: .manualIdentity
+    )
+    let compensated = try CompensationEngine.apply(matrix, to: table)
+
+    expect(compensated.column(0) == [1, 2], "FSC should not be modified by compensation")
+    expect(compensated.column(3) == [9, 10], "Time should not be modified by compensation")
+}
+
+func testCompensationMissingChannelThrows() throws {
+    let table = EventTable(channels: [Channel(name: "FITC-A")], columns: [[1]])
+    let matrix = CompensationMatrix.identity(name: "Missing", parameters: ["FITC-A", "PE-A"])
+
+    do {
+        _ = try CompensationEngine.apply(matrix, to: table)
+        fatalError("missing compensation channel should throw")
+    } catch CompensationError.missingChannel("PE-A") {
+    } catch {
+        fatalError("missing compensation channel should produce a specific error")
+    }
+}
+
 func testSingleCellDelimitedParserGenesByCells() throws {
     let rows = [
         ["gene", "Cell1", "Cell2"],
@@ -181,7 +295,8 @@ func singleFloatFCS(
     parameterStain: String? = nil,
     eventCountText: String = "1",
     bitWidthText: String = "32",
-    includeKeywordOffsets: Bool = false
+    includeKeywordOffsets: Bool = false,
+    extraText: String = ""
 ) -> Data {
     let stainText = parameterStain.map { "/$P1S/\($0)" } ?? ""
     let textStart = 58
@@ -190,7 +305,7 @@ func singleFloatFCS(
     var dataEnd = 0
 
     for _ in 0..<4 {
-        text = "/$TOT/\(eventCountText)/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/\(parameterName)/$P1B/\(bitWidthText)/$P1R/262144\(stainText)"
+        text = "/$TOT/\(eventCountText)/$PAR/1/$DATATYPE/F/$BYTEORD/\(byteOrder)/$P1N/\(parameterName)/$P1B/\(bitWidthText)/$P1R/262144\(stainText)\(extraText)"
         if includeKeywordOffsets {
             text += "/$BEGINDATA/ \(dataStart) /$ENDDATA/\(dataEnd)      "
         }
@@ -248,6 +363,14 @@ testRangesTolerateInvalidMasks()
 try testFCSTextParserHandlesEscapedDelimiter()
 try testFCSFloatByteOrders()
 try testFCSMarkerFluorochromeLabels()
+try testSpilloverParserNormalizesFractionsToPercent()
+try testSpilloverParserKeepsPercentUnits()
+try testFCSParserReadsSpillWithoutDollarPrefix()
+try testSpilloverParserPreservesUnmatchedParameters()
+try testCompensationIdentityLeavesValuesUnchanged()
+try testCompensationTwoChannelSpill()
+try testCompensationLeavesUnlistedChannelsUnchanged()
+try testCompensationMissingChannelThrows()
 try testSingleCellDelimitedParserGenesByCells()
 try testSeqtometrySignatureParser()
 try testSeqtometryScoreMatchesReferenceExample()

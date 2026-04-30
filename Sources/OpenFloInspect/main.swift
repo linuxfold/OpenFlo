@@ -17,6 +17,14 @@ print("Events: \(table.rowCount)")
 print("Channels: \(table.channelCount)")
 print("Datatype: \(keywords["$DATATYPE"] ?? "?")")
 print("Byte order: \(keywords["$BYTEORD"] ?? "?")")
+if let matrix = file.acquisitionCompensation {
+    print("Acquisition compensation: \(matrix.name), \(matrix.parameters.count) parameters")
+    print("Compensation parameters: \(matrix.parameters.joined(separator: ", "))")
+} else if keywords.keys.contains(where: { $0.contains("SPILL") || $0.contains("COMP") }) {
+    print("Acquisition compensation: keyword found but not parsed")
+} else {
+    print("Acquisition compensation: none")
+}
 
 for index in table.channels.indices {
     let channel = table.channels[index]

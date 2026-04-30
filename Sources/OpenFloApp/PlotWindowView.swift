@@ -364,11 +364,7 @@ struct PlotWindowView: View {
             model.clearGate(recompute: false)
         }
 
-        if selection.gateID != nil {
-            refreshCurrentPopulationFromWorkspace()
-        } else {
-            syncActiveGateForCurrentAxes()
-        }
+        refreshCurrentPopulationFromWorkspace()
     }
 
     private func refreshCurrentPopulationFromWorkspace() {

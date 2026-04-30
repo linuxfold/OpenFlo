@@ -26,6 +26,21 @@ struct WorkspaceRow: Identifiable, Equatable {
     let isGate: Bool
     let isGroupGate: Bool
     let isSynced: Bool
+    let compensationBadge: WorkspaceCompensationBadge?
+}
+
+struct WorkspaceCompensationBadge: Equatable {
+    enum Style: Equatable {
+        case assignedAcquisition
+        case assignedUser
+        case available
+        case error
+    }
+
+    let matrixID: UUID?
+    let style: Style
+    let colorHex: String?
+    let tooltip: String
 }
 
 struct WorkspaceLayout: Codable, Identifiable, Equatable {
@@ -161,7 +176,11 @@ final class WorkspaceSample: Identifiable, ObservableObject {
     let url: URL?
     let kind: WorkspaceSampleKind
     @Published var name: String
+    var rawTable: EventTable
     @Published var table: EventTable
+    var metadata: FCSMetadata?
+    @Published var compensationMatrixID: UUID?
+    var acquisitionCompensationMatrixID: UUID?
     @Published var gates: [WorkspaceGateNode]
 
     init(
@@ -169,14 +188,22 @@ final class WorkspaceSample: Identifiable, ObservableObject {
         name: String,
         url: URL?,
         kind: WorkspaceSampleKind,
+        rawTable: EventTable? = nil,
         table: EventTable,
+        metadata: FCSMetadata? = nil,
+        compensationMatrixID: UUID? = nil,
+        acquisitionCompensationMatrixID: UUID? = nil,
         gates: [WorkspaceGateNode] = []
     ) {
         self.id = id
         self.name = name
         self.url = url
         self.kind = kind
+        self.rawTable = rawTable ?? table
         self.table = table
+        self.metadata = metadata
+        self.compensationMatrixID = compensationMatrixID
+        self.acquisitionCompensationMatrixID = acquisitionCompensationMatrixID
         self.gates = gates
     }
 }
@@ -199,6 +226,8 @@ enum WorkspaceSampleKind: String, Codable, Equatable, Sendable {
 final class WorkspaceModel: ObservableObject {
     @Published var groupGates: [WorkspaceGateNode] = []
     @Published var samples: [WorkspaceSample] = []
+    @Published var compensationMatrices: [CompensationMatrix] = []
+    @Published var autoApplyAcquisitionCompensation = true
     @Published var selected: WorkspaceSelection?
     @Published var layouts: [WorkspaceLayout] = [WorkspaceLayout(name: "Layout")]
     @Published var selectedLayoutID: UUID?
@@ -233,7 +262,8 @@ final class WorkspaceModel: ObservableObject {
                     role: sample.kind.rowLabel,
                     isGate: false,
                     isGroupGate: false,
-                    isSynced: sampleMatchesAllTemplates(sample)
+                    isSynced: sampleMatchesAllTemplates(sample),
+                    compensationBadge: compensationBadge(for: sample)
                 )
             ]
             appendGateRows(sample.gates, sampleID: sample.id, depth: 1, output: &output, isGroup: false)
@@ -245,6 +275,10 @@ final class WorkspaceModel: ObservableObject {
         var output: [WorkspaceRow] = []
         appendGateRows(groupGates, sampleID: WorkspaceSelection.allSamplesID, depth: 1, output: &output, isGroup: true)
         return output
+    }
+
+    var compensationGroupSampleCount: Int {
+        samples.filter(isCompensationControlSample).count
     }
 
     init() {
@@ -278,15 +312,37 @@ final class WorkspaceModel: ObservableObject {
                 do {
                     let file = try FCSParser.load(url: url)
                     Task { @MainActor in
-                        let sample = WorkspaceSample(name: url.lastPathComponent, url: url, kind: .fcs, table: file.table)
+                        let sample = WorkspaceSample(
+                            name: url.lastPathComponent,
+                            url: url,
+                            kind: .fcs,
+                            rawTable: file.table,
+                            table: file.table,
+                            metadata: file.metadata
+                        )
                         self.samples.append(sample)
+                        var compensationStatus = ""
+                        if let acquisition = file.acquisitionCompensation {
+                            let matrixID = self.addOrReuseMatrix(acquisition)
+                            sample.acquisitionCompensationMatrixID = matrixID
+                            if self.autoApplyAcquisitionCompensation {
+                                do {
+                                    try self.assignCompensation(matrixID, to: sample.id)
+                                    compensationStatus = " Acquisition compensation applied."
+                                } catch {
+                                    compensationStatus = " Acquisition compensation could not be applied: \(error.localizedDescription)"
+                                }
+                            } else {
+                                compensationStatus = " Acquisition compensation is available."
+                            }
+                        }
                         if !self.groupGates.isEmpty {
                             self.applyGroupTemplatesToSamples()
                         }
                         if self.selected == nil {
                             self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
                         }
-                        self.finishProgress(progressID, status: "Loaded \(url.lastPathComponent).")
+                        self.finishProgress(progressID, status: "Loaded \(url.lastPathComponent).\(compensationStatus)")
                     }
                 } catch {
                     Task { @MainActor in
@@ -471,6 +527,7 @@ final class WorkspaceModel: ObservableObject {
                                 name: "PBMC3k Seqtometry Demo",
                                 url: matrixDirectory,
                                 kind: .singleCell,
+                                rawTable: table,
                                 table: table
                             )
                             self.samples.append(sample)
@@ -500,6 +557,7 @@ final class WorkspaceModel: ObservableObject {
     func newWorkspace() {
         groupGates.removeAll()
         samples.removeAll()
+        compensationMatrices.removeAll()
         selected = nil
         layouts = [WorkspaceLayout(name: "Layout")]
         selectedLayoutID = layouts.first?.id
@@ -547,13 +605,15 @@ final class WorkspaceModel: ObservableObject {
                     name: sample.name,
                     urlPath: sample.url?.path,
                     kind: sample.kind,
-                    gates: sample.gates.map { WorkspaceGateSnapshot(node: $0) }
+                    gates: sample.gates.map { WorkspaceGateSnapshot(node: $0) },
+                    compensationMatrixID: sample.compensationMatrixID
                 )
             },
             groupGates: groupGates.map { WorkspaceGateSnapshot(node: $0) },
             layouts: layouts,
             selectedLayoutID: selectedLayoutID,
-            lastGraphDisplayStates: lastGraphDisplayStateBySelectionKey
+            lastGraphDisplayStates: lastGraphDisplayStateBySelectionKey,
+            compensationMatrices: compensationMatrices
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -568,7 +628,22 @@ final class WorkspaceModel: ObservableObject {
                 let data = try Data(contentsOf: url)
                 let document = try JSONDecoder().decode(WorkspaceDocument.self, from: data)
                 var loadedSamples: [WorkspaceSample] = []
+                var loadedMatrices = document.compensationMatrices
                 var missingSamples: [String] = []
+                var compensationWarnings: [String] = []
+
+                func addOrReuseLocalMatrix(_ matrix: CompensationMatrix) -> UUID {
+                    if let existing = loadedMatrices.first(where: {
+                        $0.parameters == matrix.parameters
+                            && $0.percent == matrix.percent
+                            && $0.source == matrix.source
+                            && $0.locked == matrix.locked
+                    }) {
+                        return existing.id
+                    }
+                    loadedMatrices.append(matrix)
+                    return matrix.id
+                }
 
                 for sampleSnapshot in document.samples {
                     guard let path = sampleSnapshot.urlPath else {
@@ -577,19 +652,48 @@ final class WorkspaceModel: ObservableObject {
                     }
                     let sampleURL = URL(fileURLWithPath: path)
                     do {
-                        let table: EventTable
+                        let rawTable: EventTable
+                        var effectiveTable: EventTable
+                        var metadata: FCSMetadata?
+                        var acquisitionMatrixID: UUID?
                         switch sampleSnapshot.kind {
                         case .fcs:
-                            table = try FCSParser.load(url: sampleURL).table
+                            let file = try FCSParser.load(url: sampleURL)
+                            rawTable = file.table
+                            effectiveTable = file.table
+                            metadata = file.metadata
+                            if let acquisition = file.acquisitionCompensation {
+                                acquisitionMatrixID = addOrReuseLocalMatrix(acquisition)
+                            }
                         case .singleCell:
-                            table = try SingleCellDataParser.load(url: sampleURL).table
+                            rawTable = try SingleCellDataParser.load(url: sampleURL).table
+                            effectiveTable = rawTable
+                        }
+
+                        var compensationMatrixID = sampleSnapshot.compensationMatrixID
+                        if let matrixID = compensationMatrixID {
+                            if let matrix = loadedMatrices.first(where: { $0.id == matrixID }) {
+                                do {
+                                    effectiveTable = try CompensationEngine.apply(matrix, to: rawTable)
+                                } catch {
+                                    compensationMatrixID = nil
+                                    compensationWarnings.append("\(sampleSnapshot.name): \(error.localizedDescription)")
+                                }
+                            } else {
+                                compensationMatrixID = nil
+                                compensationWarnings.append("\(sampleSnapshot.name): saved compensation matrix was missing")
+                            }
                         }
                         let sample = WorkspaceSample(
                             id: sampleSnapshot.id,
                             name: sampleSnapshot.name,
                             url: sampleURL,
                             kind: sampleSnapshot.kind,
-                            table: table,
+                            rawTable: rawTable,
+                            table: effectiveTable,
+                            metadata: metadata,
+                            compensationMatrixID: compensationMatrixID,
+                            acquisitionCompensationMatrixID: acquisitionMatrixID,
                             gates: sampleSnapshot.gates.map { $0.node() }
                         )
                         loadedSamples.append(sample)
@@ -601,6 +705,7 @@ final class WorkspaceModel: ObservableObject {
                 Task { @MainActor in
                     self.groupGates = document.groupGates.map { $0.node() }
                     self.samples = loadedSamples
+                    self.compensationMatrices = loadedMatrices
                     self.layouts = document.layouts.isEmpty ? [WorkspaceLayout(name: "Layout")] : document.layouts
                     self.selectedLayoutID = document.selectedLayoutID ?? self.layouts.first?.id
                     self.selected = self.samples.first.map { WorkspaceSelection(sampleID: $0.id, gateID: nil) }
@@ -609,7 +714,9 @@ final class WorkspaceModel: ObservableObject {
                     }
                     self.lastGraphDisplayStateBySelectionKey = document.lastGraphDisplayStates
                     self.gateChangeVersion += 1
-                    if missingSamples.isEmpty {
+                    if !compensationWarnings.isEmpty {
+                        self.status = "Opened workspace with \(compensationWarnings.count) compensation warning\(compensationWarnings.count == 1 ? "" : "s")."
+                    } else if missingSamples.isEmpty {
                         self.status = "Opened workspace \(url.lastPathComponent)."
                     } else {
                         self.status = "Opened workspace with \(missingSamples.count) missing sample reference\(missingSamples.count == 1 ? "" : "s")."
@@ -646,9 +753,368 @@ final class WorkspaceModel: ObservableObject {
     func openPreferences() {
         let alert = NSAlert()
         alert.messageText = "Preferences"
-        alert.informativeText = "Preferences will appear here as OpenFlo grows."
+        alert.informativeText = "Acquisition compensation is currently applied automatically when an FCS file contains $SPILL or $SPILLOVER."
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    func openCompensationForSelectedSample() {
+        guard let selected else {
+            openCompensationEditor(matrixID: compensationMatrices.first?.id, sampleID: samples.first?.id)
+            return
+        }
+        openCompensationEditor(for: selected)
+    }
+
+    func openExistingCompensationForEditing(for selection: WorkspaceSelection) {
+        guard !selection.isAllSamples, let sample = sample(id: selection.sampleID) else {
+            if let sample = samples.first(where: { existingCompensationMatrixID(for: $0) != nil }) {
+                openExistingCompensationForEditing(for: WorkspaceSelection(sampleID: sample.id, gateID: nil))
+            } else {
+                status = "Select an FCS sample that already has a compensation matrix."
+            }
+            return
+        }
+        guard let matrixID = existingCompensationMatrixID(for: sample),
+              let matrix = compensationMatrix(id: matrixID) else {
+            status = "\(sample.name) has no acquisition or assigned compensation matrix to edit."
+            return
+        }
+
+        openCompensationEditor(matrixID: matrix.id, sampleID: sample.id)
+    }
+
+    func canEditExistingCompensation(for selection: WorkspaceSelection?) -> Bool {
+        if let selection, !selection.isAllSamples, let sample = sample(id: selection.sampleID) {
+            return existingCompensationMatrixID(for: sample) != nil
+        }
+        return samples.contains { existingCompensationMatrixID(for: $0) != nil }
+    }
+
+    func openCompensationEditor(for selection: WorkspaceSelection) {
+        guard !selection.isAllSamples, let sample = sample(id: selection.sampleID) else {
+            openCompensationEditor(matrixID: compensationMatrices.first?.id, sampleID: samples.first?.id)
+            return
+        }
+        let matrixID = sample.compensationMatrixID
+            ?? sample.acquisitionCompensationMatrixID
+            ?? compensationMatrices.first?.id
+        openCompensationEditor(matrixID: matrixID, sampleID: sample.id)
+    }
+
+    func openCompensationEditor(matrixID: UUID?, sampleID: UUID?) {
+        let root = CompensationMatrixEditorView(
+            workspace: self,
+            initialMatrixID: matrixID,
+            initialSampleID: sampleID
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Compensation Matrix Editor"
+        window.center()
+        window.contentView = NSHostingView(rootView: root)
+        let controller = NSWindowController(window: window)
+        plotWindowControllers.append(controller)
+        controller.showWindow(nil)
+    }
+
+    @discardableResult
+    func addOrReuseMatrix(_ matrix: CompensationMatrix) -> UUID {
+        if let existing = compensationMatrices.first(where: {
+            $0.parameters == matrix.parameters
+                && $0.percent == matrix.percent
+                && $0.source == matrix.source
+                && $0.locked == matrix.locked
+        }) {
+            return existing.id
+        }
+        compensationMatrices.append(matrix)
+        return matrix.id
+    }
+
+    func compensationMatrix(id: UUID?) -> CompensationMatrix? {
+        guard let id else { return nil }
+        return compensationMatrices.first { $0.id == id }
+    }
+
+    func compensationMatrixValue(matrixID: UUID, source: Int, target: Int) -> Double {
+        guard let matrix = compensationMatrix(id: matrixID),
+              matrix.percent.indices.contains(source),
+              matrix.percent[source].indices.contains(target) else {
+            return 0
+        }
+        return matrix.percent[source][target]
+    }
+
+    func renameMatrix(_ matrixID: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = compensationMatrices.firstIndex(where: { $0.id == matrixID }) else { return }
+        compensationMatrices[index].name = trimmed
+        compensationMatrices[index].modifiedAt = Date()
+        objectWillChange.send()
+        status = "Renamed compensation matrix."
+    }
+
+    @discardableResult
+    func updateMatrixValue(matrixID: UUID, source: Int, target: Int, percent: Double) -> Bool {
+        guard let index = compensationMatrices.firstIndex(where: { $0.id == matrixID }),
+              compensationMatrices[index].percent.indices.contains(source),
+              compensationMatrices[index].percent[source].indices.contains(target) else {
+            return false
+        }
+        guard !compensationMatrices[index].locked else {
+            status = "Create an editable copy before changing an acquisition-defined matrix."
+            return false
+        }
+        guard source != target else {
+            status = "Diagonal compensation values stay at 100%."
+            return false
+        }
+        guard percent.isFinite else {
+            status = "Compensation values must be finite numbers."
+            return false
+        }
+
+        var updatedMatrix = compensationMatrices[index]
+        updatedMatrix.percent[source][target] = percent
+        updatedMatrix.modifiedAt = Date()
+
+        do {
+            _ = try CompensationEngine.invert(CompensationEngine.spilloverFractions(from: updatedMatrix))
+            let assignedSamples = samples.filter { $0.compensationMatrixID == matrixID }
+            let updatedTables = try assignedSamples.map { sample in
+                (sample.id, try CompensationEngine.apply(updatedMatrix, to: sample.rawTable))
+            }
+            compensationMatrices[index] = updatedMatrix
+            objectWillChange.send()
+            for (sampleID, table) in updatedTables {
+                guard let sample = sample(id: sampleID) else { continue }
+                sample.table = table
+                refreshCounts(in: sample)
+            }
+            invalidateAnalysisAfterCompensationChange()
+            status = "Updated \(updatedMatrix.parameters[source]) -> \(updatedMatrix.parameters[target]) compensation."
+            return true
+        } catch {
+            status = "Could not update compensation: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func duplicateMatrixForEditing(_ matrixID: UUID, assignTo sampleID: UUID? = nil) -> UUID? {
+        guard let copy = editableDraftCopy(of: matrixID) else { return nil }
+        compensationMatrices.append(copy)
+        if let sampleID {
+            do {
+                try assignCompensation(copy.id, to: sampleID)
+            } catch {
+                status = "Created editable copy, but could not apply it: \(error.localizedDescription)"
+            }
+        } else {
+            status = "Created \(copy.name)."
+        }
+        return copy.id
+    }
+
+    func editableDraftCopy(of matrixID: UUID) -> CompensationMatrix? {
+        guard let source = compensationMatrix(id: matrixID) else { return nil }
+        var copy = source
+        copy.id = UUID()
+        copy.name = uniqueMatrixName("\(source.name)-copy")
+        copy.locked = false
+        copy.originalMatrixID = source.locked || source.originalMatrixID != nil ? (source.originalMatrixID ?? source.id) : nil
+        copy.source = source.locked ? .acquisitionCopy : source.source
+        copy.colorHex = nextMatrixColorHex()
+        copy.createdAt = Date()
+        copy.modifiedAt = copy.createdAt
+        return copy
+    }
+
+    func saveEditedMatrixCopy(_ matrix: CompensationMatrix) throws -> UUID {
+        _ = try CompensationEngine.invert(CompensationEngine.spilloverFractions(from: matrix))
+        var saved = matrix
+        if compensationMatrices.contains(where: { $0.id == saved.id }) {
+            saved.id = UUID()
+        }
+        saved.name = uniqueMatrixName(saved.name)
+        saved.locked = false
+        saved.createdAt = Date()
+        saved.modifiedAt = saved.createdAt
+        compensationMatrices.append(saved)
+        status = "Saved \(saved.name). Drag it with M or Apply to All Samples."
+        return saved.id
+    }
+
+    @discardableResult
+    func createIdentityMatrixForSelectedSample() -> UUID? {
+        guard let sample = selected.flatMap({ sample(id: $0.sampleID) }) ?? samples.first else {
+            status = "Load a sample before creating a compensation matrix."
+            return nil
+        }
+        let parameters = defaultCompensationParameters(for: sample)
+        guard parameters.count >= 2 else {
+            status = "Could not find enough fluorescence channels for a matrix."
+            return nil
+        }
+        let matrix = CompensationMatrix.identity(
+            name: uniqueMatrixName("Manual Compensation"),
+            parameters: parameters,
+            colorHex: nextMatrixColorHex()
+        )
+        compensationMatrices.append(matrix)
+        status = "Created \(matrix.name)."
+        return matrix.id
+    }
+
+    func resetMatrix(_ matrixID: UUID) {
+        guard let index = compensationMatrices.firstIndex(where: { $0.id == matrixID }) else { return }
+        guard let originalID = compensationMatrices[index].originalMatrixID,
+              let original = compensationMatrix(id: originalID) else {
+            status = "This matrix has no acquisition original to reset from."
+            return
+        }
+        var reset = compensationMatrices[index]
+        reset.percent = original.percent
+        reset.modifiedAt = Date()
+        compensationMatrices[index] = reset
+        reapplyMatrixToAssignedSamples(reset)
+        status = "Reset \(reset.name) to its original acquisition values."
+    }
+
+    func assignCompensation(_ matrixID: UUID?, to sampleID: UUID) throws {
+        guard let sample = sample(id: sampleID) else { return }
+        objectWillChange.send()
+        if let matrixID {
+            guard let matrix = compensationMatrix(id: matrixID) else { return }
+            sample.table = try CompensationEngine.apply(matrix, to: sample.rawTable)
+            sample.compensationMatrixID = matrixID
+            status = "Applied \(matrix.name) to \(sample.name)."
+        } else {
+            sample.table = sample.rawTable
+            sample.compensationMatrixID = nil
+            status = "Showing \(sample.name) uncompensated."
+        }
+        refreshCounts(in: sample)
+        invalidateAnalysisAfterCompensationChange()
+    }
+
+    func assignCompensationToAllCompatible(_ matrixID: UUID?) {
+        guard let matrixID else {
+            for sample in samples {
+                try? assignCompensation(nil, to: sample.id)
+            }
+            status = "Showing all samples uncompensated."
+            return
+        }
+        guard let matrix = compensationMatrix(id: matrixID) else { return }
+        var appliedCount = 0
+        var failedCount = 0
+        for sample in samples where sample.kind == .fcs {
+            do {
+                try assignCompensation(matrixID, to: sample.id)
+                appliedCount += 1
+            } catch {
+                failedCount += 1
+            }
+        }
+        if failedCount == 0 {
+            status = "Applied \(matrix.name) to \(appliedCount) sample\(appliedCount == 1 ? "" : "s")."
+        } else {
+            status = "Applied \(matrix.name) to \(appliedCount) sample\(appliedCount == 1 ? "" : "s"); \(failedCount) incompatible."
+        }
+    }
+
+    func applyAcquisitionCompensation(for selection: WorkspaceSelection) {
+        guard !selection.isAllSamples,
+              let sample = sample(id: selection.sampleID),
+              let matrixID = sample.acquisitionCompensationMatrixID else {
+            status = "No acquisition compensation matrix is available for that sample."
+            return
+        }
+        do {
+            try assignCompensation(matrixID, to: sample.id)
+        } catch {
+            status = "Could not apply acquisition compensation: \(error.localizedDescription)"
+        }
+    }
+
+    func editCompensationCopy(for selection: WorkspaceSelection) {
+        guard !selection.isAllSamples,
+              let sample = sample(id: selection.sampleID),
+              let matrixID = existingCompensationMatrixID(for: sample) else {
+            status = "No compensation matrix is available to copy."
+            return
+        }
+        openCompensationEditor(matrixID: matrixID, sampleID: sample.id)
+    }
+
+    func hasCompensationMatrix(for selection: WorkspaceSelection) -> Bool {
+        guard !selection.isAllSamples, let sample = sample(id: selection.sampleID) else { return false }
+        return existingCompensationMatrixID(for: sample) != nil
+    }
+
+    func compensationDragPayload(matrixID: UUID) -> String {
+        "compensation:\(matrixID.uuidString)"
+    }
+
+    func copyCompensation(dragPayload payload: String, to target: WorkspaceSelection) -> Bool {
+        guard payload.hasPrefix("compensation:"),
+              let matrixID = UUID(uuidString: String(payload.dropFirst("compensation:".count))) else {
+            return false
+        }
+        if target.isAllSamples {
+            assignCompensationToAllCompatible(matrixID)
+            return true
+        }
+        do {
+            try assignCompensation(matrixID, to: target.sampleID)
+        } catch {
+            status = "Could not apply compensation: \(error.localizedDescription)"
+        }
+        return true
+    }
+
+    func exportMatrixCSV(_ matrixID: UUID, to url: URL) throws {
+        guard let matrix = compensationMatrix(id: matrixID) else { return }
+        var rows: [String] = []
+        rows.append(([""] + matrix.parameters).map(csvEscape).joined(separator: ","))
+        for source in matrix.parameters.indices {
+            let values = matrix.percent[source].map { String(format: "%.6g", $0) }
+            rows.append(([matrix.parameters[source]] + values).map(csvEscape).joined(separator: ","))
+        }
+        try rows.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        status = "Saved \(matrix.name) as CSV."
+    }
+
+    func exportMatrixXML(_ matrixID: UUID, to url: URL) throws {
+        guard let matrix = compensationMatrix(id: matrixID) else { return }
+        var lines = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<CompensationMatrix name=\"\(xmlEscape(matrix.name))\" units=\"percent\">",
+            "  <Parameters>"
+        ]
+        for parameter in matrix.parameters {
+            lines.append("    <Parameter name=\"\(xmlEscape(parameter))\" />")
+        }
+        lines.append("  </Parameters>")
+        lines.append("  <Coefficients>")
+        for source in matrix.parameters.indices {
+            for target in matrix.parameters.indices {
+                lines.append(
+                    "    <Coefficient source=\"\(xmlEscape(matrix.parameters[source]))\" target=\"\(xmlEscape(matrix.parameters[target]))\" value=\"\(String(format: "%.12g", matrix.percent[source][target]))\" />"
+                )
+            }
+        }
+        lines.append("  </Coefficients>")
+        lines.append("</CompensationMatrix>")
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        status = "Saved \(matrix.name) as XML."
     }
 
     func addLayout() {
@@ -933,6 +1399,9 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func copyGate(dragPayload: String, to target: WorkspaceSelection) {
+        if copyCompensation(dragPayload: dragPayload, to: target) {
+            return
+        }
         let gateIDs: [UUID]
         if dragPayload.hasPrefix("gates:") {
             gateIDs = dragPayload
@@ -2666,7 +3135,8 @@ final class WorkspaceModel: ObservableObject {
                     role: isGroup ? "Template" : "Gate",
                     isGate: true,
                     isGroupGate: isGroup,
-                    isSynced: isGroup ? allSamplesMatchTemplate(path: currentPath) : sampleGateMatchesTemplate(path: currentPath)
+                    isSynced: isGroup ? allSamplesMatchTemplate(path: currentPath) : sampleGateMatchesTemplate(path: currentPath),
+                    compensationBadge: nil
                 )
             )
             appendGateRows(gate.children, sampleID: sampleID, depth: depth + 1, output: &output, isGroup: isGroup, path: currentPath)
@@ -2675,6 +3145,120 @@ final class WorkspaceModel: ObservableObject {
 
     private func sample(id: UUID) -> WorkspaceSample? {
         samples.first { $0.id == id }
+    }
+
+    private func compensationBadge(for sample: WorkspaceSample) -> WorkspaceCompensationBadge? {
+        if let matrix = compensationMatrix(id: sample.compensationMatrixID) {
+            let style: WorkspaceCompensationBadge.Style = matrix.locked ? .assignedAcquisition : .assignedUser
+            return WorkspaceCompensationBadge(
+                matrixID: matrix.id,
+                style: style,
+                colorHex: matrix.colorHex,
+                tooltip: "\(matrix.name) assigned"
+            )
+        }
+        if let matrix = compensationMatrix(id: sample.acquisitionCompensationMatrixID) {
+            return WorkspaceCompensationBadge(
+                matrixID: matrix.id,
+                style: .available,
+                colorHex: matrix.colorHex,
+                tooltip: "\(matrix.name) available"
+            )
+        }
+        return nil
+    }
+
+    private func existingCompensationMatrixID(for sample: WorkspaceSample) -> UUID? {
+        if let matrixID = sample.compensationMatrixID, compensationMatrix(id: matrixID) != nil {
+            return matrixID
+        }
+        if let matrixID = sample.acquisitionCompensationMatrixID, compensationMatrix(id: matrixID) != nil {
+            return matrixID
+        }
+        return nil
+    }
+
+    private func reapplyMatrixToAssignedSamples(_ matrix: CompensationMatrix) {
+        do {
+            let updatedTables = try samples
+                .filter { $0.compensationMatrixID == matrix.id }
+                .map { sample in
+                    (sample.id, try CompensationEngine.apply(matrix, to: sample.rawTable))
+                }
+            objectWillChange.send()
+            for (sampleID, table) in updatedTables {
+                guard let sample = sample(id: sampleID) else { continue }
+                sample.table = table
+                refreshCounts(in: sample)
+            }
+            invalidateAnalysisAfterCompensationChange()
+        } catch {
+            status = "Could not reapply compensation: \(error.localizedDescription)"
+        }
+    }
+
+    private func invalidateAnalysisAfterCompensationChange() {
+        gateMaskCache.removeAll()
+        layoutPlotSnapshotCache.removeAll()
+        channelIndexLookupCache.removeAll()
+        signatureChannelNameCache.removeAll()
+        gateChangeVersion += 1
+    }
+
+    private func uniqueMatrixName(_ baseName: String) -> String {
+        let existing = Set(compensationMatrices.map(\.name))
+        guard existing.contains(baseName) else { return baseName }
+        var index = 2
+        while existing.contains("\(baseName) \(index)") {
+            index += 1
+        }
+        return "\(baseName) \(index)"
+    }
+
+    private func nextMatrixColorHex() -> String {
+        let colors = ["#007AFF", "#FF3B30", "#30B0C7", "#AF52DE", "#FF9500", "#34C759"]
+        let assigned = Set(compensationMatrices.compactMap(\.colorHex))
+        return colors.first { !assigned.contains($0) } ?? colors[compensationMatrices.count % colors.count]
+    }
+
+    private func defaultCompensationParameters(for sample: WorkspaceSample) -> [String] {
+        let candidates = sample.rawTable.channels.map(\.name).filter { name in
+            let upper = name.uppercased()
+            return !upper.hasPrefix("FSC")
+                && !upper.hasPrefix("SSC")
+                && upper != "TIME"
+                && !upper.contains("WIDTH")
+        }
+        let areaChannels = candidates.filter { $0.uppercased().hasSuffix("-A") }
+        return areaChannels.count >= 2 ? areaChannels : candidates
+    }
+
+    private func isCompensationControlSample(_ sample: WorkspaceSample) -> Bool {
+        guard sample.kind == .fcs else { return false }
+        var haystack = sample.name
+        if let fileName = sample.metadata?.keywords["$FIL"] ?? sample.metadata?.keywords["FIL"] {
+            haystack += " \(fileName)"
+        }
+        if let sampleID = sample.metadata?.keywords["$SMNO"] ?? sample.metadata?.keywords["SMNO"] {
+            haystack += " \(sampleID)"
+        }
+        let normalized = haystack.lowercased()
+        return normalized.contains("comp") || normalized.contains("unstained")
+    }
+
+    private func csvEscape(_ value: String) -> String {
+        if value.contains(",") || value.contains("\"") || value.contains("\n") {
+            return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+        return value
+    }
+
+    private func xmlEscape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 
     private func beginProgress(title: String, detail: String, fraction: Double?) -> UUID {
@@ -2826,6 +3410,7 @@ final class WorkspaceModel: ObservableObject {
                     Task { @MainActor in
                         guard let target = self.sample(id: sampleID) else { return }
                         self.gateMaskCache.removeAll()
+                        target.rawTable = scoredTable
                         target.table = scoredTable
                         self.refreshCounts(in: target)
                         self.gateChangeVersion += 1

@@ -8,14 +8,16 @@ struct WorkspaceDocument: Codable, Sendable {
     var layouts: [WorkspaceLayout]
     var selectedLayoutID: UUID?
     var lastGraphDisplayStates: [String: WorkspaceGraphDisplayState]
+    var compensationMatrices: [CompensationMatrix]
 
     init(
-        version: Int = 1,
+        version: Int = 2,
         samples: [WorkspaceSampleSnapshot],
         groupGates: [WorkspaceGateSnapshot],
         layouts: [WorkspaceLayout],
         selectedLayoutID: UUID?,
-        lastGraphDisplayStates: [String: WorkspaceGraphDisplayState] = [:]
+        lastGraphDisplayStates: [String: WorkspaceGraphDisplayState] = [:],
+        compensationMatrices: [CompensationMatrix] = []
     ) {
         self.version = version
         self.samples = samples
@@ -23,6 +25,7 @@ struct WorkspaceDocument: Codable, Sendable {
         self.layouts = layouts
         self.selectedLayoutID = selectedLayoutID
         self.lastGraphDisplayStates = lastGraphDisplayStates
+        self.compensationMatrices = compensationMatrices
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -32,6 +35,7 @@ struct WorkspaceDocument: Codable, Sendable {
         case layouts
         case selectedLayoutID
         case lastGraphDisplayStates
+        case compensationMatrices
     }
 
     init(from decoder: Decoder) throws {
@@ -45,6 +49,10 @@ struct WorkspaceDocument: Codable, Sendable {
             [String: WorkspaceGraphDisplayState].self,
             forKey: .lastGraphDisplayStates
         ) ?? [:]
+        compensationMatrices = try container.decodeIfPresent(
+            [CompensationMatrix].self,
+            forKey: .compensationMatrices
+        ) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -55,6 +63,7 @@ struct WorkspaceDocument: Codable, Sendable {
         try container.encode(layouts, forKey: .layouts)
         try container.encodeIfPresent(selectedLayoutID, forKey: .selectedLayoutID)
         try container.encode(lastGraphDisplayStates, forKey: .lastGraphDisplayStates)
+        try container.encode(compensationMatrices, forKey: .compensationMatrices)
     }
 }
 
@@ -64,6 +73,42 @@ struct WorkspaceSampleSnapshot: Codable, Sendable {
     var urlPath: String?
     var kind: WorkspaceSampleKind
     var gates: [WorkspaceGateSnapshot]
+    var compensationMatrixID: UUID?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case urlPath
+        case kind
+        case gates
+        case compensationMatrixID
+    }
+
+    init(
+        id: UUID,
+        name: String,
+        urlPath: String?,
+        kind: WorkspaceSampleKind,
+        gates: [WorkspaceGateSnapshot],
+        compensationMatrixID: UUID? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.urlPath = urlPath
+        self.kind = kind
+        self.gates = gates
+        self.compensationMatrixID = compensationMatrixID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        urlPath = try container.decodeIfPresent(String.self, forKey: .urlPath)
+        kind = try container.decode(WorkspaceSampleKind.self, forKey: .kind)
+        gates = try container.decode([WorkspaceGateSnapshot].self, forKey: .gates)
+        compensationMatrixID = try container.decodeIfPresent(UUID.self, forKey: .compensationMatrixID)
+    }
 }
 
 struct WorkspaceGateSnapshot: Codable, Sendable {
