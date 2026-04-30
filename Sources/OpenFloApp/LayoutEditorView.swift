@@ -165,7 +165,7 @@ struct LayoutEditorView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("Group")
-                    Menu("All Samples") {}
+                    Menu("All Samples (\(workspace.samples.count))") {}
                         .frame(width: 210)
                 }
                 HStack {
@@ -340,9 +340,6 @@ struct LayoutEditorView: View {
                     .padding(6)
             }
             .background(Color(nsColor: .textBackgroundColor))
-            .onDrop(of: [UTType.plainText.identifier], isTargeted: nil) { providers in
-                handleGateDrop(providers)
-            }
         }
     }
 
@@ -358,7 +355,13 @@ struct LayoutEditorView: View {
             onSelect: { selectedItemID = $0 },
             onUpdate: { item in workspace.updateLayoutItem(item) },
             onDelete: { id in workspace.deleteLayoutItem(id: id) },
-            onOverlayDrop: { payload, item in addOverlay(payload, to: item) }
+            onPopulationDrop: { payload, position, targetItem in
+                if let targetItem {
+                    addOverlay(payload, to: targetItem)
+                } else {
+                    addPlots(fromDragPayload: payload, at: position)
+                }
+            }
         )
     }
 
@@ -524,6 +527,7 @@ struct LayoutEditorView: View {
                     }
                     .controlSize(.small)
                 }
+                overlayLayerControls(descriptor: descriptor)
             }
 
             Picker("Type", selection: Binding<PlotMode>(
@@ -537,12 +541,18 @@ struct LayoutEditorView: View {
 
             axisControl("X Axis", selection: Binding<String>(
                 get: { descriptor.wrappedValue.xChannelName ?? channels.first ?? "" },
-                set: { descriptor.wrappedValue.xChannelName = $0 }
+                set: {
+                    descriptor.wrappedValue.xChannelName = $0
+                    descriptor.wrappedValue.xAxisSettings = nil
+                }
             ), options: channelOptions)
 
             axisControl("Y Axis", selection: Binding<String>(
                 get: { descriptor.wrappedValue.yChannelName ?? channels.dropFirst().first ?? channels.first ?? "" },
-                set: { descriptor.wrappedValue.yChannelName = $0 }
+                set: {
+                    descriptor.wrappedValue.yChannelName = $0
+                    descriptor.wrappedValue.yAxisSettings = nil
+                }
             ), options: channelOptions)
             .disabled(descriptor.wrappedValue.plotMode.isOneDimensional)
             .opacity(descriptor.wrappedValue.plotMode.isOneDimensional ? 0.45 : 1)
@@ -550,6 +560,10 @@ struct LayoutEditorView: View {
             Toggle("Show background grid", isOn: Binding<Bool>(
                 get: { descriptor.wrappedValue.showGrid },
                 set: { descriptor.wrappedValue.showGrid = $0 }
+            ))
+            Toggle("Show axes", isOn: Binding<Bool>(
+                get: { descriptor.wrappedValue.showAxes },
+                set: { descriptor.wrappedValue.showAxes = $0 }
             ))
             Toggle("Show ancestry thumbnails", isOn: Binding<Bool>(
                 get: { descriptor.wrappedValue.showAncestry },
@@ -572,6 +586,57 @@ struct LayoutEditorView: View {
                 }
             }
         }
+    }
+
+    private func overlayLayerControls(descriptor: Binding<WorkspacePlotDescriptor>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Overlay Layers")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color(named: layoutOverlayColorName(at: 0)))
+                    .frame(width: 9, height: 9)
+                Text(descriptor.wrappedValue.name)
+                    .lineLimit(1)
+                Spacer()
+                Toggle("Control", isOn: Binding<Bool>(
+                    get: { descriptor.wrappedValue.sourceIsControl },
+                    set: { isControl in
+                        descriptor.wrappedValue.sourceIsControl = isControl
+                        descriptor.wrappedValue.lockedSourceSelection = isControl ? descriptor.wrappedValue.sourceSelection : nil
+                    }
+                ))
+                .toggleStyle(.checkbox)
+            }
+            .font(.caption)
+
+            ForEach(descriptor.wrappedValue.overlays.indices, id: \.self) { index in
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(color(named: descriptor.wrappedValue.overlays[index].colorName))
+                        .frame(width: 9, height: 9)
+                    Text(descriptor.wrappedValue.overlays[index].name)
+                        .lineLimit(1)
+                    Spacer()
+                    Toggle("Control", isOn: Binding<Bool>(
+                        get: { descriptor.wrappedValue.overlays[index].isControl },
+                        set: { isControl in
+                            descriptor.wrappedValue.overlays[index].isControl = isControl
+                            descriptor.wrappedValue.overlays[index].lockedSourceSelection = isControl
+                                ? descriptor.wrappedValue.overlays[index].sourceSelection
+                                : nil
+                        }
+                    ))
+                    .toggleStyle(.checkbox)
+                }
+                .font(.caption)
+            }
+        }
+        .padding(7)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .overlay(Rectangle().stroke(Color.black.opacity(0.12), lineWidth: 1))
     }
 
     @ViewBuilder
@@ -793,25 +858,31 @@ struct LayoutEditorView: View {
         selectedItemID = item.id
     }
 
-    private func handleGateDrop(_ providers: [NSItemProvider]) -> Bool {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                guard let payload = gatePayload(from: item) else { return }
-                Task { @MainActor in
-                    let descriptors = workspace.plotDescriptors(fromDragPayload: payload)
-                    for (index, descriptor) in descriptors.enumerated() {
-                        let frame = LayoutFrame.defaultPlot.offsetBy(dx: Double(index) * 28, dy: Double(index) * 28)
-                        let item = WorkspaceLayoutItem(frame: frame, kind: .plot(descriptor))
-                        workspace.addLayoutItem(item)
-                        selectedItemID = item.id
-                    }
-                    status = descriptors.isEmpty
-                        ? "Drop a gate or population row from the workspace."
-                        : "Added \(descriptors.count) graph plot\(descriptors.count == 1 ? "" : "s")."
-                }
-            }
+    private func addPlots(fromDragPayload payload: String, at position: CGPoint?) {
+        let descriptors = workspace.plotDescriptors(fromDragPayload: payload)
+        for (index, descriptor) in descriptors.enumerated() {
+            let frame = droppedPlotFrame(at: position, offsetIndex: index)
+            let item = WorkspaceLayoutItem(frame: frame, kind: .plot(descriptor))
+            workspace.addLayoutItem(item)
+            selectedItemID = item.id
         }
-        return true
+        status = descriptors.isEmpty
+            ? "Drop a gate or population row from the workspace."
+            : "Added \(descriptors.count) graph plot\(descriptors.count == 1 ? "" : "s")."
+    }
+
+    private func droppedPlotFrame(at position: CGPoint?, offsetIndex: Int) -> LayoutFrame {
+        let defaultFrame = LayoutFrame.defaultPlot
+        let offset = Double(offsetIndex) * 28
+        guard let position else {
+            return defaultFrame.offsetBy(dx: offset, dy: offset)
+        }
+        return LayoutFrame(
+            x: max(0, Double(position.x) - defaultFrame.width / 2 + offset),
+            y: max(0, Double(position.y) - defaultFrame.height / 2 + offset),
+            width: defaultFrame.width,
+            height: defaultFrame.height
+        )
     }
 
     private func deleteSelectedItem() {
@@ -930,7 +1001,7 @@ struct LayoutEditorView: View {
                 onSelect: { _ in },
                 onUpdate: { _ in },
                 onDelete: { _ in },
-                onOverlayDrop: { _, _ in }
+                onPopulationDrop: { _, _, _ in }
             )
             .frame(width: size.width, height: size.height)
         )
@@ -965,7 +1036,6 @@ struct LayoutEditorView: View {
         }
 
         var updated = item
-        descriptor.plotMode = .dot
         descriptor.overlays.append(contentsOf: newOverlays)
         updated.kind = .plot(descriptor)
         workspace.updateLayoutItem(updated)
@@ -985,7 +1055,9 @@ private struct LayoutPageView: View {
     let onSelect: (UUID?) -> Void
     let onUpdate: (WorkspaceLayoutItem) -> Void
     let onDelete: (UUID) -> Void
-    let onOverlayDrop: (String, WorkspaceLayoutItem) -> Void
+    let onPopulationDrop: (String, CGPoint, WorkspaceLayoutItem?) -> Void
+
+    @State private var dropTargetItemID: UUID?
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -1023,10 +1095,10 @@ private struct LayoutPageView: View {
                         iterationSampleID: iterationSampleID,
                         isInteractive: isInteractive,
                         zoom: zoom,
+                        dropTargeted: dropTargetItemID == item.id,
                         onSelect: { onSelect(item.id) },
                         onUpdate: onUpdate,
-                        onDelete: { onDelete(item.id) },
-                        onOverlayDrop: { payload in onOverlayDrop(payload, item) }
+                        onDelete: { onDelete(item.id) }
                     )
                 }
             } else {
@@ -1040,6 +1112,59 @@ private struct LayoutPageView: View {
         .background(Color.white)
         .overlay(Rectangle().stroke(Color.black, lineWidth: 1.4))
         .contentShape(Rectangle())
+        .onDrop(
+            of: [UTType.plainText.identifier],
+            delegate: LayoutPopulationDropDelegate(
+                items: layout?.items ?? [],
+                isInteractive: isInteractive,
+                dropTargetItemID: $dropTargetItemID,
+                onDrop: onPopulationDrop
+            )
+        )
+    }
+}
+
+private struct LayoutPopulationDropDelegate: DropDelegate {
+    let items: [WorkspaceLayoutItem]
+    let isInteractive: Bool
+    @Binding var dropTargetItemID: UUID?
+    let onDrop: (String, CGPoint, WorkspaceLayoutItem?) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        isInteractive && info.hasItemsConforming(to: [UTType.plainText.identifier])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        dropTargetItemID = hitPlotItem(at: info.location)?.id
+        return DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        dropTargetItemID = nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard validateDrop(info: info) else { return false }
+        let location = info.location
+        let targetItem = hitPlotItem(at: location)
+        dropTargetItemID = nil
+        for provider in info.itemProviders(for: [UTType.plainText.identifier]) {
+            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                guard let payload = gatePayload(from: item) else { return }
+                Task { @MainActor in
+                    onDrop(payload, location, targetItem)
+                }
+            }
+        }
+        return true
+    }
+
+    private func hitPlotItem(at point: CGPoint) -> WorkspaceLayoutItem? {
+        items.reversed().first { item in
+            guard case .plot = item.kind else { return false }
+            let rect = CGRect(x: item.frame.x, y: item.frame.y, width: item.frame.width, height: item.frame.height)
+            return rect.contains(point)
+        }
     }
 }
 
@@ -1050,15 +1175,14 @@ private struct LayoutCanvasItemView: View {
     let iterationSampleID: UUID?
     let isInteractive: Bool
     let zoom: Double
+    let dropTargeted: Bool
     let onSelect: () -> Void
     let onUpdate: (WorkspaceLayoutItem) -> Void
     let onDelete: () -> Void
-    let onOverlayDrop: (String) -> Void
 
     @State private var dragStartFrame: LayoutFrame?
     @State private var resizeStartFrame: LayoutFrame?
     @State private var activeResizeHandle: LayoutResizeHandle?
-    @State private var isDropTargeted = false
 
     var body: some View {
         itemBody
@@ -1077,7 +1201,7 @@ private struct LayoutCanvasItemView: View {
                 }
             }
             .overlay {
-                if isDropTargeted, acceptsOverlayDrop {
+                if dropTargeted, acceptsOverlayDrop {
                     Rectangle()
                         .stroke(Color.red, style: StrokeStyle(lineWidth: 3, dash: [7, 4]))
                         .background(Color.red.opacity(0.08))
@@ -1085,9 +1209,6 @@ private struct LayoutCanvasItemView: View {
                 }
             }
             .position(x: item.frame.x + item.frame.width / 2, y: item.frame.y + item.frame.height / 2)
-            .onDrop(of: [UTType.plainText.identifier], isTargeted: $isDropTargeted) { providers in
-                handleOverlayDrop(providers)
-            }
             .contextMenu {
                 Button("Delete") { onDelete() }
             }
@@ -1125,7 +1246,8 @@ private struct LayoutCanvasItemView: View {
             LayoutPlotItemView(
                 workspace: workspace,
                 descriptor: descriptor,
-                iterationSampleID: iterationSampleID
+                iterationSampleID: iterationSampleID,
+                onSetLayerControl: setLayerControl
             )
         case .text(let text):
             Text(text)
@@ -1203,17 +1325,19 @@ private struct LayoutCanvasItemView: View {
         CGSize(width: CGFloat(item.frame.width), height: CGFloat(item.frame.height))
     }
 
-    private func handleOverlayDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard acceptsOverlayDrop else { return false }
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                guard let payload = gatePayload(from: item) else { return }
-                Task { @MainActor in
-                    onOverlayDrop(payload)
-                }
-            }
+    private func setLayerControl(layerID: UUID?, isControl: Bool) {
+        guard case .plot(var descriptor) = item.kind else { return }
+        if let layerID {
+            guard let index = descriptor.overlays.firstIndex(where: { $0.id == layerID }) else { return }
+            descriptor.overlays[index].isControl = isControl
+            descriptor.overlays[index].lockedSourceSelection = isControl ? descriptor.overlays[index].sourceSelection : nil
+        } else {
+            descriptor.sourceIsControl = isControl
+            descriptor.lockedSourceSelection = isControl ? descriptor.sourceSelection : nil
         }
-        return true
+        var updated = item
+        updated.kind = .plot(descriptor)
+        onUpdate(updated)
     }
 }
 
@@ -1334,6 +1458,7 @@ private struct LayoutPlotItemView: View {
     @ObservedObject var workspace: WorkspaceModel
     let descriptor: WorkspacePlotDescriptor
     let iterationSampleID: UUID?
+    let onSetLayerControl: (UUID?, Bool) -> Void
 
     @State private var snapshot: LayoutPlotSnapshot?
     @State private var activeRenderID: String?
@@ -1343,22 +1468,20 @@ private struct LayoutPlotItemView: View {
         let renderID = workspace.layoutPlotSnapshotRenderID(for: descriptor, iterationSampleID: iterationSampleID)
         VStack(spacing: 0) {
             ZStack {
-                if let image = snapshot?.image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .interpolation(.none)
-                        .padding(22)
+                if let image = snapshot?.image, let snapshot {
+                    LayoutPlotImageFrame(
+                        image: image,
+                        snapshot: snapshot,
+                        descriptor: descriptor
+                    )
                 } else {
                     Rectangle()
                         .fill(Color.gray.opacity(0.12))
-                    Text(isRendering ? "Rendering plot..." : "Missing population")
+                    Text(isRendering ? "Rendering plot..." : (snapshot?.placeholderMessage ?? "Missing population"))
                         .font(.headline)
                         .foregroundStyle(.secondary)
-                }
-
-                if descriptor.showGrid {
-                    PlotGridOverlay()
-                        .padding(22)
+                        .multilineTextAlignment(.center)
+                        .padding(12)
                 }
 
                 if descriptor.showAncestry, let snapshot {
@@ -1381,13 +1504,15 @@ private struct LayoutPlotItemView: View {
                 Text("\(snapshot?.populationName ?? descriptor.name) • \((snapshot?.eventCount ?? 0).formatted()) events")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                HStack {
-                    Text(snapshot?.xAxisTitle ?? "X Axis")
-                    Spacer()
-                    Text(snapshot?.yAxisTitle ?? "Y Axis")
+                if !descriptor.showAxes {
+                    HStack {
+                        Text(snapshot?.xAxisTitle ?? "X Axis")
+                        Spacer()
+                        Text(snapshot?.yAxisTitle ?? "Y Axis")
+                    }
+                    .font(.system(size: descriptor.axisFontSize * 0.72))
+                    .foregroundStyle(color(named: descriptor.axisColorName))
                 }
-                .font(.system(size: descriptor.axisFontSize * 0.72))
-                .foregroundStyle(color(named: descriptor.axisColorName))
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 6)
@@ -1464,19 +1589,296 @@ private struct LayoutPlotItemView: View {
                     Rectangle()
                         .fill(color(named: entry.colorName))
                         .frame(width: 9, height: 9)
-                    Text(entry.name)
+                    Text(entry.isControl ? "\(entry.name)  Control" : entry.name)
+                        .italic(entry.isControl)
                         .lineLimit(1)
                     Text(entry.eventCount.formatted())
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
                 .font(.system(size: 8, weight: .semibold))
+                .contextMenu {
+                    if entry.isControl {
+                        Button("Unset Control") {
+                            onSetLayerControl(entry.layerID, false)
+                        }
+                    } else {
+                        Button("Set as Control") {
+                            onSetLayerControl(entry.layerID, true)
+                        }
+                    }
+                }
             }
         }
         .padding(5)
         .frame(maxWidth: 190, alignment: .leading)
         .background(Color.white.opacity(0.88))
         .overlay(Rectangle().stroke(Color.black.opacity(0.25), lineWidth: 1))
+    }
+}
+
+private struct LayoutPlotImageFrame: View {
+    let image: NSImage
+    let snapshot: LayoutPlotSnapshot
+    let descriptor: WorkspacePlotDescriptor
+
+    var body: some View {
+        GeometryReader { geometry in
+            let drawAxes = descriptor.showAxes && snapshot.xAxisRange != nil && snapshot.yAxisRange != nil
+            let leftInset = drawAxes ? max(46, descriptor.axisFontSize * 3.8) : 22
+            let bottomInset = drawAxes ? max(36, descriptor.axisFontSize * 2.9) : 22
+            let topInset: CGFloat = drawAxes ? 10 : 22
+            let rightInset: CGFloat = drawAxes ? 12 : 22
+            let plotWidth = max(20, geometry.size.width - leftInset - rightInset)
+            let plotHeight = max(20, geometry.size.height - topInset - bottomInset)
+            let plotRect = CGRect(x: leftInset, y: topInset, width: plotWidth, height: plotHeight)
+
+            ZStack(alignment: .topLeading) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: plotRect.width, height: plotRect.height)
+                    .position(x: plotRect.midX, y: plotRect.midY)
+
+                if descriptor.showGrid {
+                    PlotGridOverlay()
+                        .frame(width: plotRect.width, height: plotRect.height)
+                        .position(x: plotRect.midX, y: plotRect.midY)
+                }
+
+                if drawAxes,
+                   let xRange = snapshot.xAxisRange,
+                   let yRange = snapshot.yAxisRange {
+                    LayoutPlotAxesOverlay(
+                        snapshot: snapshot,
+                        descriptor: descriptor,
+                        plotRect: plotRect,
+                        xRange: xRange,
+                        yRange: yRange
+                    )
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+        }
+    }
+}
+
+private struct LayoutPlotAxesOverlay: View {
+    let snapshot: LayoutPlotSnapshot
+    let descriptor: WorkspacePlotDescriptor
+    let plotRect: CGRect
+    let xRange: ClosedRange<Float>
+    let yRange: ClosedRange<Float>
+
+    private var fontSize: CGFloat {
+        max(7, descriptor.axisFontSize * 0.72)
+    }
+
+    private var xTicks: [LayoutAxisTick] {
+        LayoutAxisTick.majorTicks(for: xRange, transform: descriptor.xAxisSettings?.transform)
+    }
+
+    private var yTicks: [LayoutAxisTick] {
+        let transform = descriptor.plotMode.isOneDimensional ? nil : descriptor.yAxisSettings?.transform
+        return LayoutAxisTick.majorTicks(for: yRange, transform: transform)
+    }
+
+    var body: some View {
+        let xTicks = xTicks
+        let yTicks = yTicks
+        let xMinorTicks = LayoutAxisTick.minorTicks(from: xTicks, in: xRange)
+        let yMinorTicks = LayoutAxisTick.minorTicks(from: yTicks, in: yRange)
+
+        ZStack(alignment: .topLeading) {
+            Canvas { context, _ in
+                var border = Path()
+                border.addRect(plotRect)
+                context.stroke(border, with: .color(.black), lineWidth: 1)
+
+                var minor = Path()
+                for value in xMinorTicks {
+                    let x = xPosition(value)
+                    minor.move(to: CGPoint(x: x, y: plotRect.maxY))
+                    minor.addLine(to: CGPoint(x: x, y: plotRect.maxY + 4))
+                }
+                for value in yMinorTicks {
+                    let y = yPosition(value)
+                    minor.move(to: CGPoint(x: plotRect.minX, y: y))
+                    minor.addLine(to: CGPoint(x: plotRect.minX - 4, y: y))
+                }
+                context.stroke(minor, with: .color(.black), lineWidth: 0.8)
+
+                var major = Path()
+                for tick in xTicks {
+                    let x = xPosition(tick.value)
+                    major.move(to: CGPoint(x: x, y: plotRect.maxY))
+                    major.addLine(to: CGPoint(x: x, y: plotRect.maxY + 8))
+                }
+                for tick in yTicks {
+                    let y = yPosition(tick.value)
+                    major.move(to: CGPoint(x: plotRect.minX, y: y))
+                    major.addLine(to: CGPoint(x: plotRect.minX - 8, y: y))
+                }
+                context.stroke(major, with: .color(.black), lineWidth: 1.4)
+            }
+
+            ForEach(Array(xTicks.enumerated()), id: \.offset) { _, tick in
+                Text(tick.label)
+                    .font(.system(size: fontSize, weight: .regular))
+                    .foregroundStyle(color(named: descriptor.axisColorName))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .position(x: xPosition(tick.value), y: plotRect.maxY + 19)
+            }
+
+            ForEach(Array(yTicks.enumerated()), id: \.offset) { _, tick in
+                Text(tick.label)
+                    .font(.system(size: fontSize, weight: .regular))
+                    .foregroundStyle(color(named: descriptor.axisColorName))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .frame(width: max(28, plotRect.minX - 14), alignment: .trailing)
+                    .position(x: max(14, (plotRect.minX - 14) / 2), y: yPosition(tick.value))
+            }
+
+            Text(snapshot.xAxisTitle)
+                .font(.system(size: descriptor.axisFontSize, weight: .regular))
+                .foregroundStyle(color(named: descriptor.axisColorName))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(width: plotRect.width, alignment: .center)
+                .position(x: plotRect.midX, y: plotRect.maxY + max(34, descriptor.axisFontSize * 2.2))
+
+            Text(snapshot.yAxisTitle)
+                .font(.system(size: descriptor.axisFontSize, weight: .regular))
+                .foregroundStyle(color(named: descriptor.axisColorName))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .rotationEffect(.degrees(-90))
+                .frame(width: plotRect.height, alignment: .center)
+                .position(x: 14, y: plotRect.midY)
+        }
+    }
+
+    private func xPosition(_ value: Float) -> CGFloat {
+        let span = max(xRange.upperBound - xRange.lowerBound, Float.leastNonzeroMagnitude)
+        let fraction = min(max((value - xRange.lowerBound) / span, 0), 1)
+        return plotRect.minX + CGFloat(fraction) * plotRect.width
+    }
+
+    private func yPosition(_ value: Float) -> CGFloat {
+        let span = max(yRange.upperBound - yRange.lowerBound, Float.leastNonzeroMagnitude)
+        let fraction = min(max((value - yRange.lowerBound) / span, 0), 1)
+        return plotRect.maxY - CGFloat(fraction) * plotRect.height
+    }
+}
+
+private struct LayoutAxisTick {
+    let value: Float
+    let label: String
+
+    static func majorTicks(
+        for range: ClosedRange<Float>,
+        transform: TransformKind?,
+        targetCount: Int = 5
+    ) -> [LayoutAxisTick] {
+        guard range.lowerBound.isFinite,
+              range.upperBound.isFinite,
+              range.upperBound > range.lowerBound else {
+            return []
+        }
+
+        if transform?.usesDecadeRange == true {
+            return decadeTicks(for: range, targetCount: targetCount)
+        }
+
+        let span = range.upperBound - range.lowerBound
+        let step = niceStep(span / Float(max(targetCount - 1, 1)))
+        guard step.isFinite, step > 0 else { return [] }
+        var value = ceil(range.lowerBound / step) * step
+        var ticks: [LayoutAxisTick] = []
+        var guardCount = 0
+        while value <= range.upperBound + step * 0.25, guardCount < 12 {
+            ticks.append(LayoutAxisTick(value: value, label: linearLabel(value)))
+            value += step
+            guardCount += 1
+        }
+        return ticks
+    }
+
+    static func minorTicks(from majorTicks: [LayoutAxisTick], in range: ClosedRange<Float>) -> [Float] {
+        guard majorTicks.count >= 2 else { return [] }
+        let step = majorTicks[1].value - majorTicks[0].value
+        guard step.isFinite, step > 0 else { return [] }
+        let minorStep = step / 5
+        guard minorStep > 0 else { return [] }
+        var value = floor(range.lowerBound / minorStep) * minorStep
+        var output: [Float] = []
+        var guardCount = 0
+        while value <= range.upperBound + minorStep * 0.25, guardCount < 80 {
+            let isMajor = majorTicks.contains { abs($0.value - value) < minorStep * 0.25 }
+            if !isMajor, value >= range.lowerBound, value <= range.upperBound {
+                output.append(value)
+            }
+            value += minorStep
+            guardCount += 1
+        }
+        return output
+    }
+
+    private static func decadeTicks(for range: ClosedRange<Float>, targetCount: Int) -> [LayoutAxisTick] {
+        let lower = Int(ceil(range.lowerBound))
+        let upper = Int(floor(range.upperBound))
+        guard lower <= upper else {
+            return majorTicks(for: range, transform: nil, targetCount: targetCount)
+        }
+        let count = upper - lower + 1
+        let strideValue = max(1, Int(ceil(Double(count) / Double(max(targetCount + 1, 1)))))
+        return stride(from: lower, through: upper, by: strideValue).map { exponent in
+            LayoutAxisTick(value: Float(exponent), label: decadeLabel(exponent))
+        }
+    }
+
+    private static func niceStep(_ rawStep: Float) -> Float {
+        guard rawStep.isFinite, rawStep > 0 else { return 1 }
+        let exponent = floor(log10(rawStep))
+        let magnitude = pow(Float(10), exponent)
+        let fraction = rawStep / magnitude
+        let niceFraction: Float
+        if fraction <= 1 {
+            niceFraction = 1
+        } else if fraction <= 2 {
+            niceFraction = 2
+        } else if fraction <= 5 {
+            niceFraction = 5
+        } else {
+            niceFraction = 10
+        }
+        return niceFraction * magnitude
+    }
+
+    private static func linearLabel(_ value: Float) -> String {
+        let absValue = abs(value)
+        if absValue >= 1_000_000 {
+            return String(format: "%.1fM", value / 1_000_000).replacingOccurrences(of: ".0M", with: "M")
+        }
+        if absValue >= 1_000 {
+            return String(format: "%.0fK", value / 1_000)
+        }
+        if absValue >= 10 || value == 0 {
+            return String(format: "%.0f", value)
+        }
+        return String(format: "%.2g", value)
+    }
+
+    private static func decadeLabel(_ exponent: Int) -> String {
+        if exponent == 0 {
+            return "0"
+        }
+        if exponent < 0 {
+            return "-10^\(abs(exponent))"
+        }
+        return "10^\(exponent)"
     }
 }
 

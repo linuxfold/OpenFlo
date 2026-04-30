@@ -39,6 +39,7 @@ struct PlotWindowView: View {
                 onXChannelChange: { channel in
                     model.xChannel = channel
                     axesChangedPreservingGate()
+                    recordCurrentDisplayState()
                 },
                 onYChannelChange: { channel in
                     if model.plotMode.isOneDimensional {
@@ -46,9 +47,11 @@ struct PlotWindowView: View {
                     }
                     model.yChannel = channel
                     axesChangedPreservingGate()
+                    recordCurrentDisplayState()
                 },
                 onPlotModeChange: { mode in
                     model.plotModeChanged(mode)
+                    recordCurrentDisplayState()
                 },
                 onGate: createGate,
                 onGateSelected: { gateID in
@@ -69,9 +72,11 @@ struct PlotWindowView: View {
                 },
                 onAxisTransformChange: { axis, transform in
                     model.setAxisTransform(transform, for: axis)
+                    recordCurrentDisplayState()
                 },
                 onAxisReset: { axis in
                     model.resetAxis(axis)
+                    recordCurrentDisplayState()
                 },
                 onAxisCustomize: { axis in
                     model.openAxisCustomizationWindow(for: axis)
@@ -79,10 +84,29 @@ struct PlotWindowView: View {
             )
             .background(Color.white)
 
-            PlotOptionsPanel(model: model)
+            PlotOptionsPanel(model: model, onDisplayStateChanged: recordCurrentDisplayState)
         }
         .onAppear {
             restoreGateForCurrentAxes()
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.xChannel) {
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.yChannel) {
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.plotMode) {
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.xTransform) {
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.yTransform) {
+            recordCurrentDisplayState()
+        }
+        .onChange(of: model.axisSettingsVersion) {
+            recordCurrentDisplayState()
         }
         .onChange(of: workspace.gateChangeVersion) {
             syncGateStateAfterWorkspaceChange()
@@ -178,6 +202,17 @@ struct PlotWindowView: View {
 
     private func rowID(for selection: WorkspaceSelection) -> String {
         workspace.rowID(sampleID: selection.sampleID, gateID: selection.gateID)
+    }
+
+    private func recordCurrentDisplayState() {
+        workspace.recordLastGraphDisplayState(
+            for: selection,
+            xChannelName: model.currentXChannelName,
+            yChannelName: model.currentYChannelName,
+            plotMode: model.plotMode,
+            xAxisSettings: model.axisSettings(for: .x),
+            yAxisSettings: model.axisSettings(for: .y)
+        )
     }
 
     private func selectGateInPlot(_ gateID: String) {
@@ -355,6 +390,7 @@ struct PlotWindowView: View {
             preferredYAxisSettings: model.axisSettings(for: .y),
             restoredGate: match?.gate
         )
+        recordCurrentDisplayState()
     }
 
     private func syncActiveGateForCurrentAxes() {
@@ -396,6 +432,7 @@ struct PlotWindowView: View {
             preferredYAxisSettings: config?.yAxisSettings,
             restoredGate: previousGate
         )
+        recordCurrentDisplayState()
     }
 
     private func navigateDown() {
@@ -435,6 +472,7 @@ struct PlotWindowView: View {
             preferredYAxisSettings: model.axisSettings(for: .y),
             restoredGate: restoredGate ?? match?.gate
         )
+        recordCurrentDisplayState()
     }
 }
 
@@ -575,6 +613,7 @@ struct StandalonePlotPaneView: View {
 
 private struct PlotOptionsPanel: View {
     @ObservedObject var model: AppModel
+    var onDisplayStateChanged: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
@@ -639,7 +678,10 @@ private struct PlotOptionsPanel: View {
     private var plotModeBinding: Binding<PlotMode> {
         Binding(
             get: { model.plotMode },
-            set: { model.plotModeChanged($0) }
+            set: {
+                model.plotModeChanged($0)
+                onDisplayStateChanged()
+            }
         )
     }
 

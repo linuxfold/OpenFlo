@@ -217,6 +217,7 @@ final class WorkspaceModel: ObservableObject {
     private var gateMaskCache: [String: EventMask] = [:]
     private var channelIndexLookupCache: [ObjectIdentifier: [String: Int]] = [:]
     private var signatureChannelNameCache: [ObjectIdentifier: [String]] = [:]
+    private var lastGraphDisplayStateBySelectionKey: [String: WorkspaceGraphDisplayState] = [:]
     private var loadedSignatures: [SeqtometrySignature] = []
     private var activeProgressID: UUID?
 
@@ -505,6 +506,7 @@ final class WorkspaceModel: ObservableObject {
         lastCreatedGate = nil
         layoutPlotSnapshotCache.removeAll()
         gateMaskCache.removeAll()
+        lastGraphDisplayStateBySelectionKey.removeAll()
         loadedSignatures.removeAll()
         progress = nil
         activeProgressID = nil
@@ -550,7 +552,8 @@ final class WorkspaceModel: ObservableObject {
             },
             groupGates: groupGates.map { WorkspaceGateSnapshot(node: $0) },
             layouts: layouts,
-            selectedLayoutID: selectedLayoutID
+            selectedLayoutID: selectedLayoutID,
+            lastGraphDisplayStates: lastGraphDisplayStateBySelectionKey
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -604,6 +607,7 @@ final class WorkspaceModel: ObservableObject {
                     for sample in self.samples {
                         self.refreshCounts(in: sample)
                     }
+                    self.lastGraphDisplayStateBySelectionKey = document.lastGraphDisplayStates
                     self.gateChangeVersion += 1
                     if missingSamples.isEmpty {
                         self.status = "Opened workspace \(url.lastPathComponent)."
@@ -752,8 +756,7 @@ final class WorkspaceModel: ObservableObject {
                     height: item.frame.height * 0.72
                 )
                 if case .plot(var descriptor) = copy.kind {
-                    descriptor.sourceSelection = matchingSelection(for: descriptor, sampleID: sample.id)
-                        ?? WorkspaceSelection(sampleID: sample.id, gateID: nil)
+                    descriptor = batchResolvedDescriptor(descriptor, for: sample)
                     copy.kind = .plot(descriptor)
                 }
                 batchedItems.append(copy)
@@ -785,6 +788,34 @@ final class WorkspaceModel: ObservableObject {
         layouts.append(batch)
         selectedLayoutID = batch.id
         status = "Created \(batch.name) with \(samplesForBatch.count) sample tile\(samplesForBatch.count == 1 ? "" : "s")."
+    }
+
+    private func batchResolvedDescriptor(_ descriptor: WorkspacePlotDescriptor, for sample: WorkspaceSample) -> WorkspacePlotDescriptor {
+        var copy = descriptor
+        if copy.sourceIsControl {
+            copy.lockedSourceSelection = copy.lockedSourceSelection ?? copy.sourceSelection
+        } else {
+            copy.sourceSelection = selectionMatchingForBatch(gatePath: copy.gatePath, sample: sample)
+        }
+
+        copy.overlays = copy.overlays.map { overlay in
+            var layer = overlay
+            if layer.isControl {
+                layer.lockedSourceSelection = layer.lockedSourceSelection ?? layer.sourceSelection
+            } else {
+                layer.sourceSelection = selectionMatchingForBatch(gatePath: layer.gatePath, sample: sample)
+            }
+            return layer
+        }
+        return copy
+    }
+
+    private func selectionMatchingForBatch(gatePath: [String], sample: WorkspaceSample) -> WorkspaceSelection {
+        guard !gatePath.isEmpty else {
+            return WorkspaceSelection(sampleID: sample.id, gateID: nil)
+        }
+        let gate = gateMatchingPath(gatePath, in: sample.gates)
+        return WorkspaceSelection(sampleID: sample.id, gateID: gate?.id)
     }
 
     func openLayoutEditor() {
@@ -1018,7 +1049,22 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func dragPayload(for row: WorkspaceRow, selectedRows: [WorkspaceRow]) -> String? {
-        let gateIDs = selectedRows.compactMap(\.selection.gateID)
+        let selections = selectedRows
+            .filter { $0.isGate || !$0.selection.isAllSamples }
+            .map(\.selection)
+        guard !selections.isEmpty else { return nil }
+
+        let populations = selections.map { selection in
+            WorkspacePopulationDragItem(
+                selection: selection,
+                displayState: lastGraphDisplayState(for: selection)
+            )
+        }
+        if let encoded = WorkspacePopulationDragPayload(populations: populations).encodedString() {
+            return encoded
+        }
+
+        let gateIDs = selections.compactMap(\.gateID)
         if row.isGate, !gateIDs.isEmpty {
             if gateIDs.count == 1, let gateID = gateIDs.first {
                 return "gate:\(gateID.uuidString)"
@@ -1026,9 +1072,9 @@ final class WorkspaceModel: ObservableObject {
             return "gates:\(gateIDs.map(\.uuidString).joined(separator: ","))"
         }
 
-        let sampleIDs = selectedRows
-            .filter { !$0.isGate && !$0.selection.isAllSamples }
-            .map(\.selection.sampleID)
+        let sampleIDs = selections
+            .filter { !$0.isAllSamples }
+            .map(\.sampleID)
         guard !sampleIDs.isEmpty else { return nil }
         if sampleIDs.count == 1, let sampleID = sampleIDs.first {
             return "sample:\(sampleID.uuidString)"
@@ -1127,6 +1173,29 @@ final class WorkspaceModel: ObservableObject {
             return nil
         }
         return node.gate
+    }
+
+    func recordLastGraphDisplayState(
+        for selection: WorkspaceSelection,
+        xChannelName: String?,
+        yChannelName: String?,
+        plotMode: PlotMode,
+        xAxisSettings: AxisDisplaySettings?,
+        yAxisSettings: AxisDisplaySettings?
+    ) {
+        guard contains(selection) else { return }
+        lastGraphDisplayStateBySelectionKey[selectionKey(selection)] = WorkspaceGraphDisplayState(
+            xChannelName: xChannelName,
+            yChannelName: yChannelName,
+            plotMode: plotMode,
+            xAxisSettings: xAxisSettings,
+            yAxisSettings: yAxisSettings
+        )
+        layoutPlotSnapshotCache.removeAll()
+    }
+
+    func lastGraphDisplayState(for selection: WorkspaceSelection) -> WorkspaceGraphDisplayState? {
+        lastGraphDisplayStateBySelectionKey[selectionKey(selection)]
     }
 
     func contains(_ selection: WorkspaceSelection) -> Bool {
@@ -1312,7 +1381,14 @@ final class WorkspaceModel: ObservableObject {
         return sampleID.uuidString
     }
 
+    private func selectionKey(_ selection: WorkspaceSelection) -> String {
+        rowID(sampleID: selection.sampleID, gateID: selection.gateID)
+    }
+
     func selections(fromDragPayload payload: String) -> [WorkspaceSelection] {
+        if let structuredPayload = WorkspacePopulationDragPayload.decode(from: payload) {
+            return structuredPayload.populations.map(\.selection)
+        }
         let gateSelections = gateIDs(fromDragPayload: payload).compactMap { selection(containingGateID: $0) }
         if !gateSelections.isEmpty {
             return gateSelections
@@ -1338,7 +1414,16 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func plotDescriptors(fromDragPayload payload: String) -> [WorkspacePlotDescriptor] {
-        selections(fromDragPayload: payload).compactMap { selection in
+        if let structuredPayload = WorkspacePopulationDragPayload.decode(from: payload) {
+            return structuredPayload.populations.compactMap { item in
+                guard var descriptor = plotDescriptor(for: item.selection) else { return nil }
+                if let displayState = item.displayState {
+                    descriptor.applyDisplayState(displayState)
+                }
+                return descriptor
+            }
+        }
+        return selections(fromDragPayload: payload).compactMap { selection in
             guard let descriptor = plotDescriptor(for: selection) else { return nil }
             return descriptor
         }
@@ -1455,14 +1540,20 @@ final class WorkspaceModel: ObservableObject {
                 return nil
             }
         }
-        return WorkspacePlotDescriptor(
+        var descriptor = WorkspacePlotDescriptor(
             sourceSelection: selection,
             gatePath: gatePath,
             name: displayName(for: selection),
             xChannelName: configuration?.xChannelName,
             yChannelName: configuration?.yChannelName,
-            plotMode: .pseudocolor
+            plotMode: .pseudocolor,
+            xAxisSettings: configuration?.xAxisSettings,
+            yAxisSettings: configuration?.yAxisSettings
         )
+        if let displayState = lastGraphDisplayState(for: selection) {
+            descriptor.applyDisplayState(displayState)
+        }
+        return descriptor
     }
 
     func matchingSelection(for descriptor: WorkspacePlotDescriptor, sampleID: UUID?) -> WorkspaceSelection? {
@@ -1470,10 +1561,24 @@ final class WorkspaceModel: ObservableObject {
             if descriptor.gatePath.isEmpty {
                 return WorkspaceSelection(sampleID: sample.id, gateID: nil)
             }
-            let gate = gateMatchingPath(descriptor.gatePath, in: sample.gates)
-            return WorkspaceSelection(sampleID: sample.id, gateID: gate?.id)
+            guard let gate = gateMatchingPath(descriptor.gatePath, in: sample.gates) else {
+                return nil
+            }
+            return WorkspaceSelection(sampleID: sample.id, gateID: gate.id)
         }
-        return descriptor.sourceSelection
+        guard let sample = sample(id: descriptor.sourceSelection.sampleID) else {
+            return nil
+        }
+        if descriptor.gatePath.isEmpty {
+            return WorkspaceSelection(sampleID: sample.id, gateID: nil)
+        }
+        if let gateID = descriptor.sourceSelection.gateID, gate(id: gateID, in: sample.gates) != nil {
+            return descriptor.sourceSelection
+        }
+        guard let gate = gateMatchingPath(descriptor.gatePath, in: sample.gates) else {
+            return nil
+        }
+        return WorkspaceSelection(sampleID: sample.id, gateID: gate.id)
     }
 
     func layoutPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
@@ -1501,38 +1606,106 @@ final class WorkspaceModel: ObservableObject {
         layoutPlotSnapshotCacheKey(for: descriptor, iterationSampleID: iterationSampleID)
     }
 
+    private enum LayoutPlotResolutionFailure: Error, Equatable {
+        case noPopulation(String)
+        case missingParameter(String)
+        case missingSample
+
+        var message: String {
+            switch self {
+            case .noPopulation(let path):
+                return "No population: \(path)"
+            case .missingParameter(let name):
+                return "Missing parameter \(name)"
+            case .missingSample:
+                return "Missing sample"
+            }
+        }
+    }
+
     private func uncachedLayoutPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
         if !descriptor.overlays.isEmpty {
             return layoutOverlayPlotSnapshot(for: descriptor, iterationSampleID: iterationSampleID)
         }
 
-        guard let payload = layoutPlotRenderPayload(for: descriptor, iterationSampleID: iterationSampleID) else {
-            return nil
+        switch layoutPlotRenderPayloadResult(for: descriptor, iterationSampleID: iterationSampleID) {
+        case .success(let payload):
+            return Self.renderLayoutPlotSnapshot(from: payload)
+        case .failure(let failure):
+            return placeholderSnapshot(
+                message: failure.message,
+                descriptor: descriptor,
+                iterationSampleID: iterationSampleID
+            )
         }
-        return Self.renderLayoutPlotSnapshot(from: payload)
     }
 
     func layoutPlotRenderPayload(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotRenderPayload? {
-        guard descriptor.overlays.isEmpty else { return nil }
-        guard let selection = matchingSelection(
-            for: descriptor,
-            sampleID: descriptor.sourceSelection.isAllSamples ? iterationSampleID : iterationSampleID ?? descriptor.sourceSelection.sampleID
-        ) else {
+        guard descriptor.overlays.isEmpty else {
             return nil
         }
-        guard let sample = sample(id: selection.sampleID) else { return nil }
+        guard case .success(let payload) = layoutPlotRenderPayloadResult(for: descriptor, iterationSampleID: iterationSampleID) else {
+            return nil
+        }
+        return payload
+    }
+
+    private func layoutPlotRenderPayloadResult(
+        for descriptor: WorkspacePlotDescriptor,
+        iterationSampleID: UUID?
+    ) -> Result<LayoutPlotRenderPayload, LayoutPlotResolutionFailure> {
+        let selectionResult = resolvedSelection(
+            sourceSelection: descriptor.sourceSelection,
+            gatePath: descriptor.gatePath,
+            isControl: descriptor.sourceIsControl,
+            lockedSelection: descriptor.lockedSourceSelection,
+            iterationSampleID: iterationSampleID
+        )
+        let selection: WorkspaceSelection
+        switch selectionResult {
+        case .success(let resolvedSelection):
+            selection = resolvedSelection
+        case .failure(let failure):
+            return .failure(failure)
+        }
+
+        guard let sample = sample(id: selection.sampleID) else { return .failure(.missingSample) }
         let path = selection.gateID.flatMap { gatePath($0, in: sample.gates) } ?? []
         let table = sample.table
         let axes = AppModel.defaultAxisSelection(for: table)
         let configuration = gateConfiguration(for: selection)
-        let xIndex = descriptor.xChannelName.flatMap { channelIndex(named: $0, in: table) }
-            ?? configuration.flatMap { channelIndex(named: $0.xChannelName, in: table) }
-            ?? axes.x
-        let yIndex = descriptor.yChannelName.flatMap { channelIndex(named: $0, in: table) }
-            ?? configuration.flatMap { channelIndex(named: $0.yChannelName, in: table) }
-            ?? axes.y
-        let xSettings = configuration?.xAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[xIndex]))
-        let ySettings = configuration?.yAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[yIndex]))
+        let xIndex: Int
+        switch graphChannelIndex(
+            descriptor.xChannelName,
+            in: table,
+            fallback: configuration.flatMap { channelIndex(named: $0.xChannelName, in: table) } ?? axes.x
+        ) {
+        case .success(let index):
+            xIndex = index
+        case .failure(let failure):
+            return .failure(failure)
+        }
+        let yIndex: Int
+        if descriptor.plotMode.isOneDimensional {
+            yIndex = xIndex
+        } else {
+            switch graphChannelIndex(
+                descriptor.yChannelName,
+                in: table,
+                fallback: configuration.flatMap { channelIndex(named: $0.yChannelName, in: table) } ?? axes.y
+            ) {
+            case .success(let index):
+                yIndex = index
+            case .failure(let failure):
+                return .failure(failure)
+            }
+        }
+        let xSettings = descriptor.xAxisSettings
+            ?? configuration?.xAxisSettings
+            ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[xIndex]))
+        let ySettings = descriptor.yAxisSettings
+            ?? configuration?.yAxisSettings
+            ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[yIndex]))
         let gateSteps = path.map { node in
             LayoutGateRenderStep(
                 gate: node.gate,
@@ -1546,7 +1719,7 @@ final class WorkspaceModel: ObservableObject {
         let mask = selection.gateID.flatMap { cachedGateMask(sample: sample, gateID: $0) }
 
         if sample.kind == .singleCell {
-            return sampledSingleCellLayoutPlotRenderPayload(
+            return .success(sampledSingleCellLayoutPlotRenderPayload(
                 table: table,
                 mask: mask,
                 gateSteps: gateSteps,
@@ -1559,10 +1732,10 @@ final class WorkspaceModel: ObservableObject {
                 yAxisSettings: ySettings,
                 mode: descriptor.plotMode,
                 ancestry: path.map(\.name)
-            )
+            ))
         }
 
-        return LayoutPlotRenderPayload(
+        return .success(LayoutPlotRenderPayload(
             table: table,
             sampleKind: sample.kind,
             mask: mask,
@@ -1576,7 +1749,110 @@ final class WorkspaceModel: ObservableObject {
             yAxisSettings: ySettings,
             mode: descriptor.plotMode,
             ancestry: path.map(\.name)
+        ))
+    }
+
+    private func resolvedSelection(
+        sourceSelection: WorkspaceSelection,
+        gatePath: [String],
+        isControl: Bool,
+        lockedSelection: WorkspaceSelection?,
+        iterationSampleID: UUID?
+    ) -> Result<WorkspaceSelection, LayoutPlotResolutionFailure> {
+        if isControl {
+            return exactSelection(lockedSelection ?? sourceSelection, gatePath: gatePath)
+        }
+
+        if let iterationSampleID {
+            return selectionMatching(gatePath: gatePath, sampleID: iterationSampleID)
+        }
+
+        if sourceSelection.isAllSamples {
+            return .failure(.noPopulation(populationPathDescription(gatePath)))
+        }
+
+        return exactSelection(sourceSelection, gatePath: gatePath)
+    }
+
+    private func exactSelection(
+        _ selection: WorkspaceSelection,
+        gatePath: [String]
+    ) -> Result<WorkspaceSelection, LayoutPlotResolutionFailure> {
+        guard !selection.isAllSamples, let sample = sample(id: selection.sampleID) else {
+            return .failure(.missingSample)
+        }
+        if gatePath.isEmpty {
+            return .success(WorkspaceSelection(sampleID: sample.id, gateID: nil))
+        }
+        if let gateID = selection.gateID, gate(id: gateID, in: sample.gates) != nil {
+            return .success(selection)
+        }
+        guard let gate = gateMatchingPath(gatePath, in: sample.gates) else {
+            return .failure(.noPopulation(populationPathDescription(gatePath)))
+        }
+        return .success(WorkspaceSelection(sampleID: sample.id, gateID: gate.id))
+    }
+
+    private func selectionMatching(
+        gatePath: [String],
+        sampleID: UUID
+    ) -> Result<WorkspaceSelection, LayoutPlotResolutionFailure> {
+        guard let sample = sample(id: sampleID) else {
+            return .failure(.missingSample)
+        }
+        guard !gatePath.isEmpty else {
+            return .success(WorkspaceSelection(sampleID: sample.id, gateID: nil))
+        }
+        guard let gate = gateMatchingPath(gatePath, in: sample.gates) else {
+            return .failure(.noPopulation(populationPathDescription(gatePath)))
+        }
+        return .success(WorkspaceSelection(sampleID: sample.id, gateID: gate.id))
+    }
+
+    private func graphChannelIndex(
+        _ channelName: String?,
+        in table: EventTable,
+        fallback: Int
+    ) -> Result<Int, LayoutPlotResolutionFailure> {
+        if let channelName, !channelName.isEmpty {
+            guard let index = channelIndex(named: channelName, in: table) else {
+                return .failure(.missingParameter(channelName))
+            }
+            return .success(index)
+        }
+        return .success(min(max(fallback, 0), max(table.channelCount - 1, 0)))
+    }
+
+    private func placeholderSnapshot(
+        message: String,
+        descriptor: WorkspacePlotDescriptor,
+        iterationSampleID: UUID?
+    ) -> LayoutPlotSnapshot {
+        let sampleName: String
+        if let iterationSampleID, let sample = sample(id: iterationSampleID) {
+            sampleName = sample.name
+        } else if let sample = sample(id: descriptor.sourceSelection.sampleID) {
+            sampleName = sample.name
+        } else {
+            sampleName = "Missing sample"
+        }
+        return LayoutPlotSnapshot(
+            image: nil,
+            placeholderMessage: message,
+            sampleName: sampleName,
+            populationName: descriptor.gatePath.last ?? descriptor.name,
+            eventCount: 0,
+            xAxisTitle: descriptor.xChannelName ?? "X Axis",
+            yAxisTitle: descriptor.plotMode.isOneDimensional ? descriptor.plotMode.rawValue : (descriptor.yChannelName ?? "Y Axis"),
+            xAxisRange: nil,
+            yAxisRange: nil,
+            ancestry: descriptor.gatePath,
+            legend: []
         )
+    }
+
+    private func populationPathDescription(_ gatePath: [String]) -> String {
+        gatePath.isEmpty ? "All Events" : "/" + gatePath.joined(separator: "/")
     }
 
     private func sampledSingleCellLayoutPlotRenderPayload(
@@ -1642,15 +1918,19 @@ final class WorkspaceModel: ObservableObject {
         let yRange = payload.yAxisSettings.resolvedRange(auto: EventTable.range(values: yValues, mask: mask))
         let mode = payload.mode
         let image: NSImage
+        let displayYRange: ClosedRange<Float>
 
         if mode.isOneDimensional {
             let histogram = Histogram1D.build(values: xValues, mask: mask, width: 420, xRange: xRange)
             if mode == .cdf {
-                image = CDFRenderer.image(from: histogram, yRange: 0...1)
+                displayYRange = 0...1
+                image = CDFRenderer.image(from: histogram, yRange: displayYRange)
             } else {
-                image = HistogramRenderer.image(from: histogram, height: 420, yRange: AppModel.histogramPreviewRange(maxBin: histogram.maxBin))
+                displayYRange = AppModel.histogramPreviewRange(maxBin: histogram.maxBin)
+                image = HistogramRenderer.image(from: histogram, height: 420, yRange: displayYRange)
             }
         } else if mode == .dot {
+            displayYRange = yRange
             image = DotPlotRenderer.image(
                 xValues: xValues,
                 yValues: yValues,
@@ -1662,6 +1942,7 @@ final class WorkspaceModel: ObservableObject {
                 maxDots: 35_000
             )
         } else {
+            displayYRange = yRange
             let histogram = Histogram2D.build(
                 xValues: xValues,
                 yValues: yValues,
@@ -1689,11 +1970,14 @@ final class WorkspaceModel: ObservableObject {
 
         return LayoutPlotSnapshot(
             image: image,
+            placeholderMessage: nil,
             sampleName: payload.sampleName,
             populationName: payload.populationName,
             eventCount: payload.eventCount,
             xAxisTitle: payload.table.channels[payload.xIndex].displayName,
             yAxisTitle: mode.isOneDimensional ? mode.rawValue : payload.table.channels[payload.yIndex].displayName,
+            xAxisRange: xRange,
+            yAxisRange: displayYRange,
             ancestry: payload.ancestry,
             legend: []
         )
@@ -1718,15 +2002,19 @@ final class WorkspaceModel: ObservableObject {
         let yRange = payload.yAxisSettings.resolvedRange(auto: EventTable.range(values: yValues, mask: sampledMask))
         let mode = payload.mode
         let image: NSImage
+        let displayYRange: ClosedRange<Float>
 
         if mode.isOneDimensional {
             let histogram = Histogram1D.build(values: xValues, mask: sampledMask, width: 420, xRange: xRange)
             if mode == .cdf {
-                image = CDFRenderer.image(from: histogram, yRange: 0...1)
+                displayYRange = 0...1
+                image = CDFRenderer.image(from: histogram, yRange: displayYRange)
             } else {
-                image = HistogramRenderer.image(from: histogram, height: 420, yRange: AppModel.histogramPreviewRange(maxBin: histogram.maxBin))
+                displayYRange = AppModel.histogramPreviewRange(maxBin: histogram.maxBin)
+                image = HistogramRenderer.image(from: histogram, height: 420, yRange: displayYRange)
             }
         } else if mode == .dot {
+            displayYRange = yRange
             image = DotPlotRenderer.image(
                 xValues: xValues,
                 yValues: yValues,
@@ -1738,6 +2026,7 @@ final class WorkspaceModel: ObservableObject {
                 maxDots: maxRows
             )
         } else {
+            displayYRange = yRange
             let histogram = Histogram2D.build(
                 xValues: xValues,
                 yValues: yValues,
@@ -1765,11 +2054,14 @@ final class WorkspaceModel: ObservableObject {
 
         return LayoutPlotSnapshot(
             image: image,
+            placeholderMessage: nil,
             sampleName: payload.sampleName,
             populationName: payload.populationName,
             eventCount: payload.eventCount,
             xAxisTitle: payload.table.channels[payload.xIndex].displayName,
             yAxisTitle: mode.isOneDimensional ? mode.rawValue : payload.table.channels[payload.yIndex].displayName,
+            xAxisRange: xRange,
+            yAxisRange: displayYRange,
             ancestry: payload.ancestry,
             legend: []
         )
@@ -1893,6 +2185,9 @@ final class WorkspaceModel: ObservableObject {
             [
                 overlay.sourceSelection.sampleID.uuidString,
                 overlay.sourceSelection.gateID?.uuidString ?? "root",
+                overlay.lockedSourceSelection?.sampleID.uuidString ?? "no-lock",
+                overlay.lockedSourceSelection?.gateID?.uuidString ?? "root",
+                overlay.isControl ? "control" : "unlocked",
                 overlay.name,
                 overlay.gatePath.joined(separator: ">"),
                 overlay.colorName
@@ -1904,45 +2199,140 @@ final class WorkspaceModel: ObservableObject {
             iterationSampleID?.uuidString ?? "no-iteration",
             descriptor.sourceSelection.sampleID.uuidString,
             descriptor.sourceSelection.gateID?.uuidString ?? "root",
+            descriptor.lockedSourceSelection?.sampleID.uuidString ?? "no-lock",
+            descriptor.lockedSourceSelection?.gateID?.uuidString ?? "root",
+            descriptor.sourceIsControl ? "source-control" : "source-unlocked",
             descriptor.name,
             descriptor.gatePath.joined(separator: ">"),
             descriptor.xChannelName ?? "auto-x",
             descriptor.yChannelName ?? "auto-y",
             descriptor.plotMode.rawValue,
+            descriptor.showAxes ? "axes" : "no-axes",
+            axisSettingsCacheKey(descriptor.xAxisSettings),
+            axisSettingsCacheKey(descriptor.yAxisSettings),
             overlayKey
         ].joined(separator: "::")
     }
 
+    private func axisSettingsCacheKey(_ settings: AxisDisplaySettings?) -> String {
+        guard let settings else { return "auto-axis" }
+        return [
+            settings.transform.rawValue,
+            settings.minimum.map { String($0) } ?? "auto-min",
+            settings.maximum.map { String($0) } ?? "auto-max",
+            String(settings.extraNegativeDecades),
+            String(settings.widthBasis),
+            String(settings.positiveDecades)
+        ].joined(separator: ",")
+    }
+
+    private struct OverlayResolvedSeries {
+        var xValues: [Float]
+        var yValues: [Float]
+        var mask: EventMask?
+        var colorName: String
+        var eventCount: Int
+    }
+
     private func layoutOverlayPlotSnapshot(for descriptor: WorkspacePlotDescriptor, iterationSampleID: UUID?) -> LayoutPlotSnapshot? {
-        guard let baseSelection = matchingSelection(
-            for: descriptor,
-            sampleID: descriptor.sourceSelection.isAllSamples ? iterationSampleID : nil
-        ),
-              let baseSample = sample(id: baseSelection.sampleID) else {
-            return nil
-        }
-
-        let baseTable = baseSample.table
-        let baseAxes = AppModel.defaultAxisSelection(for: baseTable)
-        let baseConfiguration = gateConfiguration(for: baseSelection)
-        let xChannelName = descriptor.xChannelName ?? baseConfiguration?.xChannelName ?? baseTable.channels[baseAxes.x].displayName
-        let yChannelName = descriptor.yChannelName ?? baseConfiguration?.yChannelName ?? baseTable.channels[baseAxes.y].displayName
-        let xSettings = baseConfiguration?.xAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: baseTable.channels[baseAxes.x]))
-        let ySettings = baseConfiguration?.yAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: baseTable.channels[baseAxes.y]))
-
-        var series: [OverlayDotPlotSeries] = []
+        var series: [OverlayResolvedSeries] = []
         var legend: [LayoutPlotLegendEntry] = []
         var xRange: ClosedRange<Float>?
         var yRange: ClosedRange<Float>?
+        var firstFailure: LayoutPlotResolutionFailure?
+        var xAxisTitle = descriptor.xChannelName ?? "X Axis"
+        var yAxisTitle = descriptor.plotMode.isOneDimensional ? descriptor.plotMode.rawValue : (descriptor.yChannelName ?? "Y Axis")
+        var ancestry = descriptor.gatePath
 
-        func appendSeries(selection: WorkspaceSelection, name: String, colorName: String) {
-            guard let sample = sample(id: selection.sampleID) else { return }
+        func appendFailure(
+            _ failure: LayoutPlotResolutionFailure,
+            layerID: UUID?,
+            isBaseLayer: Bool,
+            colorName: String,
+            isControl: Bool
+        ) {
+            if firstFailure == nil {
+                firstFailure = failure
+            }
+            legend.append(
+                LayoutPlotLegendEntry(
+                    layerID: layerID,
+                    isBaseLayer: isBaseLayer,
+                    name: failure.message,
+                    colorName: colorName,
+                    eventCount: 0,
+                    isControl: isControl
+                )
+            )
+        }
+
+        func appendLayer(
+            sourceSelection: WorkspaceSelection,
+            layerGatePath: [String],
+            name: String?,
+            colorName: String,
+            isControl: Bool,
+            lockedSelection: WorkspaceSelection?,
+            layerID: UUID?,
+            isBaseLayer: Bool
+        ) {
+            let selectionResult = resolvedSelection(
+                sourceSelection: sourceSelection,
+                gatePath: layerGatePath,
+                isControl: isControl,
+                lockedSelection: lockedSelection,
+                iterationSampleID: iterationSampleID
+            )
+            let selection: WorkspaceSelection
+            switch selectionResult {
+            case .success(let resolvedSelection):
+                selection = resolvedSelection
+            case .failure(let failure):
+                appendFailure(failure, layerID: layerID, isBaseLayer: isBaseLayer, colorName: colorName, isControl: isControl)
+                return
+            }
+
+            guard let sample = sample(id: selection.sampleID) else {
+                appendFailure(.missingSample, layerID: layerID, isBaseLayer: isBaseLayer, colorName: colorName, isControl: isControl)
+                return
+            }
+
+            let table = sample.table
+            let axes = AppModel.defaultAxisSelection(for: table)
+            let path = selection.gateID.flatMap { gatePath($0, in: sample.gates) } ?? []
+            let xIndex: Int
+            switch graphChannelIndex(descriptor.xChannelName, in: table, fallback: axes.x) {
+            case .success(let index):
+                xIndex = index
+                xAxisTitle = table.channels[index].displayName
+            case .failure(let failure):
+                appendFailure(failure, layerID: layerID, isBaseLayer: isBaseLayer, colorName: colorName, isControl: isControl)
+                return
+            }
+
+            let yIndex: Int
+            if descriptor.plotMode.isOneDimensional {
+                yIndex = xIndex
+                yAxisTitle = descriptor.plotMode.rawValue
+            } else {
+                switch graphChannelIndex(descriptor.yChannelName, in: table, fallback: axes.y) {
+                case .success(let index):
+                    yIndex = index
+                    yAxisTitle = table.channels[index].displayName
+                case .failure(let failure):
+                    appendFailure(failure, layerID: layerID, isBaseLayer: isBaseLayer, colorName: colorName, isControl: isControl)
+                    return
+                }
+            }
+
+            let xSettings = descriptor.xAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[xIndex]))
+            let ySettings = descriptor.yAxisSettings ?? AxisDisplaySettings(transform: AppModel.defaultTransform(for: table.channels[yIndex]))
+            let eventCount: Int
+            let xValues: [Float]
+            let yValues: [Float]
+            let mask: EventMask?
+
             if sample.kind == .singleCell {
-                let table = sample.table
-                let axes = AppModel.defaultAxisSelection(for: table)
-                let path = selection.gateID.flatMap { gatePath($0, in: sample.gates) } ?? []
-                let xIndex = channelIndex(named: xChannelName, in: table) ?? axes.x
-                let yIndex = channelIndex(named: yChannelName, in: table) ?? axes.y
                 let cachedMask = selection.gateID.flatMap { cachedGateMask(sample: sample, gateID: $0) }
                 let gateSteps = path.map { node in
                     LayoutGateRenderStep(
@@ -1954,106 +2344,142 @@ final class WorkspaceModel: ObservableObject {
                     )
                 }
                 let indices: [Int]
-                let previewMask: EventMask?
                 if let cachedMask {
                     indices = Self.sampledIndices(rowCount: table.rowCount, mask: cachedMask, maxRows: 4_000)
-                    previewMask = nil
+                    mask = nil
+                    eventCount = cachedMask.selectedCount
                 } else {
                     indices = Self.sampledIndices(rowCount: table.rowCount, mask: nil, maxRows: 4_000)
-                    previewMask = Self.evaluateLayoutGateSteps(gateSteps, table: table, indices: indices)
+                    mask = Self.evaluateLayoutGateSteps(gateSteps, table: table, indices: indices)
+                    eventCount = path.last?.count ?? mask?.selectedCount ?? table.rowCount
                 }
-                let xValues = Self.applyTransform(xSettings, to: Self.sampledColumn(table, xIndex, indices: indices))
-                let yValues = Self.applyTransform(ySettings, to: Self.sampledColumn(table, yIndex, indices: indices))
-                xRange = union(xRange, EventTable.range(values: xValues, mask: previewMask))
-                yRange = union(yRange, EventTable.range(values: yValues, mask: previewMask))
-                series.append(
-                    OverlayDotPlotSeries(
-                        xValues: xValues,
-                        yValues: yValues,
-                        mask: previewMask,
-                        colorName: colorName
-                    )
-                )
-                legend.append(
-                    LayoutPlotLegendEntry(
-                        name: name,
-                        colorName: colorName,
-                        eventCount: path.last?.count ?? cachedMask?.selectedCount ?? table.rowCount
-                    )
-                )
-                return
+                xValues = Self.applyTransform(xSettings, to: Self.sampledColumn(table, xIndex, indices: indices))
+                yValues = descriptor.plotMode.isOneDimensional
+                    ? xValues
+                    : Self.applyTransform(ySettings, to: Self.sampledColumn(table, yIndex, indices: indices))
+            } else {
+                guard let population = selectedPopulation(for: selection) else {
+                    appendFailure(.noPopulation(populationPathDescription(layerGatePath)), layerID: layerID, isBaseLayer: isBaseLayer, colorName: colorName, isControl: isControl)
+                    return
+                }
+                mask = population.mask
+                eventCount = population.mask?.selectedCount ?? population.table.rowCount
+                xValues = Self.applyTransform(xSettings, to: population.table.column(xIndex))
+                yValues = descriptor.plotMode.isOneDimensional
+                    ? xValues
+                    : Self.applyTransform(ySettings, to: population.table.column(yIndex))
             }
 
-            guard let population = selectedPopulation(for: selection) else { return }
-            let axes = AppModel.defaultAxisSelection(for: population.table)
-            let xIndex = channelIndex(named: xChannelName, in: population.table) ?? axes.x
-            let yIndex = channelIndex(named: yChannelName, in: population.table) ?? axes.y
-            let xValues = Self.applyTransform(xSettings, to: population.table.column(xIndex))
-            let yValues = Self.applyTransform(ySettings, to: population.table.column(yIndex))
-            xRange = union(xRange, EventTable.range(values: xValues, mask: population.mask))
-            yRange = union(yRange, EventTable.range(values: yValues, mask: population.mask))
+            xRange = union(xRange, EventTable.range(values: xValues, mask: mask))
+            if !descriptor.plotMode.isOneDimensional {
+                yRange = union(yRange, EventTable.range(values: yValues, mask: mask))
+            }
             series.append(
-                OverlayDotPlotSeries(
+                OverlayResolvedSeries(
                     xValues: xValues,
                     yValues: yValues,
-                    mask: population.mask,
-                    colorName: colorName
+                    mask: mask,
+                    colorName: colorName,
+                    eventCount: eventCount
                 )
             )
+            let layerName = name ?? "\(sample.name) • \(path.last?.name ?? sample.name)"
             legend.append(
                 LayoutPlotLegendEntry(
-                    name: name,
+                    layerID: layerID,
+                    isBaseLayer: isBaseLayer,
+                    name: layerName,
                     colorName: colorName,
-                    eventCount: population.mask?.selectedCount ?? population.table.rowCount
+                    eventCount: eventCount,
+                    isControl: isControl
                 )
             )
+            if isBaseLayer {
+                ancestry = path.map(\.name)
+            }
         }
 
-        appendSeries(
-            selection: baseSelection,
-            name: "\(baseSample.name) • \(displayName(for: baseSelection))",
-            colorName: layoutOverlayColorName(at: 0)
+        appendLayer(
+            sourceSelection: descriptor.sourceSelection,
+            layerGatePath: descriptor.gatePath,
+            name: nil,
+            colorName: layoutOverlayColorName(at: 0),
+            isControl: descriptor.sourceIsControl,
+            lockedSelection: descriptor.lockedSourceSelection,
+            layerID: nil,
+            isBaseLayer: true
         )
 
         for overlay in descriptor.overlays {
-            let overlaySelection = matchingSelection(for: overlay, iterationSampleID: iterationSampleID)
-            if let overlaySelection {
-                appendSeries(selection: overlaySelection, name: overlay.name, colorName: overlay.colorName)
-            }
+            appendLayer(
+                sourceSelection: overlay.sourceSelection,
+                layerGatePath: overlay.gatePath,
+                name: overlay.name,
+                colorName: overlay.colorName,
+                isControl: overlay.isControl,
+                lockedSelection: overlay.lockedSourceSelection,
+                layerID: overlay.id,
+                isBaseLayer: false
+            )
         }
 
-        guard !series.isEmpty else { return nil }
-        let resolvedXRange = xRange ?? 0...1
-        let resolvedYRange = yRange ?? 0...1
-        let image = OverlayDotPlotRenderer.image(
-            series: series,
-            width: 420,
-            height: 420,
-            xRange: resolvedXRange,
-            yRange: resolvedYRange
-        )
+        guard !series.isEmpty else {
+            return placeholderSnapshot(
+                message: firstFailure?.message ?? "No overlay populations",
+                descriptor: descriptor,
+                iterationSampleID: iterationSampleID
+            )
+        }
+
+        let image: NSImage
+        let resolvedXRange = descriptor.xAxisSettings?.resolvedRange(auto: xRange ?? 0...1) ?? (xRange ?? 0...1)
+        let resolvedYRange: ClosedRange<Float>
+        if descriptor.plotMode.isOneDimensional {
+            let histograms = series.map { item in
+                OverlayHistogramSeries(
+                    histogram: Histogram1D.build(values: item.xValues, mask: item.mask, width: 420, xRange: resolvedXRange),
+                    colorName: item.colorName
+                )
+            }
+            if descriptor.plotMode == .cdf {
+                resolvedYRange = 0...1
+                image = OverlayHistogramRenderer.image(series: histograms, height: 420, yRange: resolvedYRange, cumulative: true)
+            } else {
+                let maxBin = histograms.map(\.histogram.maxBin).max() ?? 0
+                resolvedYRange = AppModel.histogramPreviewRange(maxBin: maxBin)
+                image = OverlayHistogramRenderer.image(series: histograms, height: 420, yRange: resolvedYRange)
+            }
+        } else {
+            resolvedYRange = descriptor.yAxisSettings?.resolvedRange(auto: yRange ?? 0...1) ?? (yRange ?? 0...1)
+            image = OverlayDotPlotRenderer.image(
+                series: series.map {
+                    OverlayDotPlotSeries(
+                        xValues: $0.xValues,
+                        yValues: $0.yValues,
+                        mask: $0.mask,
+                        colorName: $0.colorName
+                    )
+                },
+                width: 420,
+                height: 420,
+                xRange: resolvedXRange,
+                yRange: resolvedYRange
+            )
+        }
 
         return LayoutPlotSnapshot(
             image: image,
+            placeholderMessage: nil,
             sampleName: "Overlay (\(legend.count) populations)",
             populationName: descriptor.name,
-            eventCount: legend.reduce(0) { $0 + $1.eventCount },
-            xAxisTitle: xChannelName,
-            yAxisTitle: yChannelName,
-            ancestry: gatePathNames(for: baseSelection),
+            eventCount: series.reduce(0) { $0 + $1.eventCount },
+            xAxisTitle: xAxisTitle,
+            yAxisTitle: yAxisTitle,
+            xAxisRange: resolvedXRange,
+            yAxisRange: resolvedYRange,
+            ancestry: ancestry,
             legend: legend
         )
-    }
-
-    private func matchingSelection(for overlay: WorkspacePlotOverlayDescriptor, iterationSampleID: UUID?) -> WorkspaceSelection? {
-        if overlay.sourceSelection.isAllSamples, let iterationSampleID, let sample = sample(id: iterationSampleID) {
-            if overlay.gatePath.isEmpty {
-                return WorkspaceSelection(sampleID: sample.id, gateID: nil)
-            }
-            let gate = gateMatchingPath(overlay.gatePath, in: sample.gates)
-            return WorkspaceSelection(sampleID: sample.id, gateID: gate?.id)
-        }
-        return overlay.sourceSelection
     }
 
     private func union(_ lhs: ClosedRange<Float>?, _ rhs: ClosedRange<Float>) -> ClosedRange<Float> {
@@ -2067,6 +2493,9 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func gateIDs(fromDragPayload payload: String) -> [UUID] {
+        if let structuredPayload = WorkspacePopulationDragPayload.decode(from: payload) {
+            return structuredPayload.populations.compactMap(\.selection.gateID)
+        }
         if payload.hasPrefix("gates:") {
             return payload
                 .dropFirst(6)
@@ -2080,6 +2509,11 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private func sampleIDs(fromDragPayload payload: String) -> [UUID] {
+        if let structuredPayload = WorkspacePopulationDragPayload.decode(from: payload) {
+            return structuredPayload.populations
+                .filter { !$0.selection.isAllSamples && $0.selection.gateID == nil }
+                .map(\.selection.sampleID)
+        }
         if payload.hasPrefix("samples:") {
             return payload
                 .dropFirst(8)

@@ -84,6 +84,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var activeGate: PolygonGate?
     @Published private(set) var gateMask: EventMask?
     @Published var gateLabelPosition: PlotPoint?
+    @Published private(set) var axisSettingsVersion = 0
     @Published private var axisSettingsByChannelName: [String: AxisDisplaySettings] = [:]
 
     private var baseMask: EventMask?
@@ -219,6 +220,7 @@ final class AppModel: ObservableObject {
     func resetAxis(_ axis: PlotAxis) {
         let channelName = channels[channelIndex(for: axis)].name
         axisSettingsByChannelName[channelName] = nil
+        axisSettingsVersion += 1
         syncCurrentTransformsFromSettings()
         clearGate(recompute: false)
         recomputePlot(reason: "\(axis.title) reset")
@@ -602,7 +604,10 @@ final class AppModel: ObservableObject {
 
     private func saveAxisSettings(_ settings: AxisDisplaySettings, forChannel channelIndex: Int) {
         guard channels.indices.contains(channelIndex) else { return }
-        axisSettingsByChannelName[channels[channelIndex].name] = settings
+        let channelName = channels[channelIndex].name
+        guard axisSettingsByChannelName[channelName] != settings else { return }
+        axisSettingsByChannelName[channelName] = settings
+        axisSettingsVersion += 1
     }
 
     private func syncCurrentTransformsFromSettings() {
