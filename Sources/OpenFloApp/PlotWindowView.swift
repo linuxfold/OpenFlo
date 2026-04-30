@@ -99,6 +99,9 @@ struct PlotWindowView: View {
         .onChange(of: model.plotMode) {
             recordCurrentDisplayState()
         }
+        .onChange(of: model.histogramSmooth) {
+            recordCurrentDisplayState()
+        }
         .onChange(of: model.xTransform) {
             recordCurrentDisplayState()
         }
@@ -211,7 +214,8 @@ struct PlotWindowView: View {
             yChannelName: model.currentYChannelName,
             plotMode: model.plotMode,
             xAxisSettings: model.axisSettings(for: .x),
-            yAxisSettings: model.axisSettings(for: .y)
+            yAxisSettings: model.axisSettings(for: .y),
+            histogramSmooth: model.histogramSmooth
         )
     }
 
@@ -642,6 +646,12 @@ private struct PlotOptionsPanel: View {
                 .pickerStyle(.menu)
                 .frame(width: 260)
 
+                Toggle("Smooth", isOn: histogramSmoothBinding)
+                    .toggleStyle(.checkbox)
+                    .disabled(model.plotMode != .histogram)
+                    .opacity(model.plotMode == .histogram ? 1 : 0.45)
+                    .help("Smooth histogram bins")
+
                 HStack(spacing: 8) {
                     Text("Level:")
                         .font(.callout.weight(.semibold))
@@ -685,6 +695,16 @@ private struct PlotOptionsPanel: View {
         Binding(
             get: { model.contourLevelPercent },
             set: { model.setContourLevelPercent($0) }
+        )
+    }
+
+    private var histogramSmoothBinding: Binding<Bool> {
+        Binding(
+            get: { model.histogramSmooth },
+            set: {
+                model.setHistogramSmooth($0)
+                onDisplayStateChanged()
+            }
         )
     }
 }

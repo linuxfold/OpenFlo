@@ -13,7 +13,8 @@ enum OverlayHistogramRenderer {
         series: [OverlayHistogramSeries],
         height: Int,
         yRange: ClosedRange<Float>,
-        cumulative: Bool = false
+        cumulative: Bool = false,
+        smooth: Bool = true
     ) -> NSImage {
         guard let first = series.first else {
             return NSImage(size: NSSize(width: 1, height: max(height, 1)))
@@ -44,7 +45,7 @@ enum OverlayHistogramRenderer {
                 let color = nsColor(named: item.colorName).usingColorSpace(.deviceRGB) ?? .black
                 let points = cumulative
                     ? cumulativePoints(for: item.histogram, height: height, yRange: yRange, ySpan: ySpan)
-                    : histogramPoints(for: item.histogram, height: height, yRange: yRange, ySpan: ySpan)
+                    : histogramPoints(for: item.histogram, height: height, yRange: yRange, ySpan: ySpan, smooth: smooth)
 
                 if !cumulative {
                     fillHistogram(points: points, width: width, height: height, color: color, in: context)
@@ -65,12 +66,14 @@ enum OverlayHistogramRenderer {
         for histogram: Histogram1D,
         height: Int,
         yRange: ClosedRange<Float>,
-        ySpan: Float
+        ySpan: Float,
+        smooth: Bool
     ) -> [CGPoint] {
         let baseline = CGFloat(height - 1)
         let drawableHeight = CGFloat(height - 2)
-        return (0..<histogram.width).map { x in
-            let normalized = min(max((Float(histogram[x]) - yRange.lowerBound) / ySpan, 0), 1)
+        let bins = HistogramRenderer.displayedBins(for: histogram, smooth: smooth)
+        return bins.enumerated().map { x, count in
+            let normalized = min(max((count - yRange.lowerBound) / ySpan, 0), 1)
             return CGPoint(
                 x: CGFloat(x),
                 y: baseline - CGFloat(normalized) * drawableHeight
@@ -126,13 +129,20 @@ enum OverlayHistogramRenderer {
         guard let first = points.first else { return }
         let path = CGMutablePath()
         path.move(to: first)
-        for point in points.dropFirst() {
-            path.addLine(to: point)
-        }
+        appendTopPath(to: path, points: points)
         context.addPath(path)
         context.setStrokeColor(color.cgColor)
         context.setLineWidth(2.4)
+        context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()
+    }
+
+    private static func appendTopPath(to path: CGMutablePath, points: [CGPoint]) {
+        guard points.count > 1 else { return }
+        path.addLine(to: points[0])
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
     }
 }

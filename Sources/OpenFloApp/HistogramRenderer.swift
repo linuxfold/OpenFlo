@@ -4,13 +4,20 @@ import Foundation
 import OpenFloCore
 
 enum HistogramRenderer {
-    static func image(from histogram: Histogram1D, height: Int = 640, yRange: ClosedRange<Float>) -> NSImage {
-        let width = histogram.width
-        let yMaximum = max(yRange.upperBound, 1)
+    static func image(
+        from histogram: Histogram1D,
+        width requestedWidth: Int? = nil,
+        height: Int = 640,
+        yRange: ClosedRange<Float>,
+        smooth: Bool = true
+    ) -> NSImage {
+        let width = max(requestedWidth ?? histogram.width, 1)
+        let counts = displayCounts(for: histogram, width: width, smooth: smooth)
+        let ySpan = max(yRange.upperBound - yRange.lowerBound, Float.leastNonzeroMagnitude)
         let baseline = CGFloat(height - 1)
-        let drawableHeight = CGFloat(height - 2)
-        let topPoints = (0..<width).map { x in
-            let normalized = min(max(Float(histogram[x]) / yMaximum, 0), 1)
+        let drawableHeight = CGFloat(max(height - 2, 1))
+        let topPoints = counts.enumerated().map { x, count in
+            let normalized = min(max((count - yRange.lowerBound) / ySpan, 0), 1)
             return CGPoint(
                 x: CGFloat(x),
                 y: baseline - CGFloat(normalized) * drawableHeight
@@ -33,6 +40,7 @@ enum HistogramRenderer {
 
             context.setAllowsAntialiasing(true)
             context.setShouldAntialias(true)
+            context.interpolationQuality = .high
             context.translateBy(x: 0, y: CGFloat(height))
             context.scaleBy(x: 1, y: -1)
 
@@ -45,7 +53,7 @@ enum HistogramRenderer {
             fillPath.closeSubpath()
 
             context.addPath(fillPath)
-            context.setFillColor(NSColor(calibratedWhite: 0.62, alpha: 1).cgColor)
+            context.setFillColor(NSColor(calibratedWhite: 0.70, alpha: 1).cgColor)
             context.fillPath()
 
             let outlinePath = CGMutablePath()
@@ -57,7 +65,8 @@ enum HistogramRenderer {
             }
             context.addPath(outlinePath)
             context.setStrokeColor(NSColor.black.cgColor)
-            context.setLineWidth(3)
+            context.setLineWidth(max(2.4, min(3.4, CGFloat(width) / 210)))
+            context.setLineCap(.round)
             context.setLineJoin(.round)
             context.strokePath()
 
@@ -70,4 +79,49 @@ enum HistogramRenderer {
 
         return NSImage(cgImage: cgImage, size: NSSize(width: width, height: height))
     }
+
+    static func displayedBins(for histogram: Histogram1D, smooth: Bool) -> [Float] {
+        let rawBins = histogram.bins.map { Float($0) }
+        guard smooth else { return rawBins }
+        return gaussianSmoothed(rawBins)
+    }
+
+    static func displayMaximum(for histogram: Histogram1D, smooth: Bool) -> Float {
+        max(displayedBins(for: histogram, smooth: smooth).max() ?? 0, 1)
+    }
+
+    static func displayCounts(for histogram: Histogram1D, width: Int, smooth: Bool) -> [Float] {
+        let bins = displayedBins(for: histogram, smooth: smooth)
+        guard width > 0 else { return [] }
+        guard bins.count > 1, width > 1 else { return Array(repeating: bins.first ?? 0, count: width) }
+
+        return (0..<width).map { x in
+            let binPosition = Float(x) / Float(width - 1) * Float(bins.count - 1)
+            let lowerIndex = min(max(Int(floor(binPosition)), 0), bins.count - 1)
+            let upperIndex = min(lowerIndex + 1, bins.count - 1)
+            let fraction = binPosition - Float(lowerIndex)
+            return bins[lowerIndex] + (bins[upperIndex] - bins[lowerIndex]) * fraction
+        }
+    }
+
+    private static func gaussianSmoothed(_ values: [Float]) -> [Float] {
+        guard values.count > 2 else { return values }
+        let sigma = max(Float(1.25), min(Float(2.25), Float(values.count) / 160))
+        let radius = max(2, Int(ceil(sigma * 2.5)))
+        let weights = (-radius...radius).map { offset -> Float in
+            let distance = Float(offset)
+            return exp(-(distance * distance) / (2 * sigma * sigma))
+        }
+        let weightSum = weights.reduce(0, +)
+
+        return values.indices.map { index in
+            var total: Float = 0
+            for offset in -radius...radius {
+                let sourceIndex = min(max(index + offset, 0), values.count - 1)
+                total += values[sourceIndex] * weights[offset + radius]
+            }
+            return total / max(weightSum, Float.leastNonzeroMagnitude)
+        }
+    }
+
 }

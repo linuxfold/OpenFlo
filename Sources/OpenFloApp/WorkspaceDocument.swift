@@ -6,6 +6,7 @@ struct WorkspaceDocument: Codable, Sendable {
     var samples: [WorkspaceSampleSnapshot]
     var groupGates: [WorkspaceGateSnapshot]
     var layouts: [WorkspaceLayout]
+    var tableTemplates: [WorkspaceTableTemplate]
     var selectedLayoutID: UUID?
     var lastGraphDisplayStates: [String: WorkspaceGraphDisplayState]
     var compensationMatrices: [CompensationMatrix]
@@ -15,6 +16,7 @@ struct WorkspaceDocument: Codable, Sendable {
         samples: [WorkspaceSampleSnapshot],
         groupGates: [WorkspaceGateSnapshot],
         layouts: [WorkspaceLayout],
+        tableTemplates: [WorkspaceTableTemplate] = [],
         selectedLayoutID: UUID?,
         lastGraphDisplayStates: [String: WorkspaceGraphDisplayState] = [:],
         compensationMatrices: [CompensationMatrix] = []
@@ -23,6 +25,7 @@ struct WorkspaceDocument: Codable, Sendable {
         self.samples = samples
         self.groupGates = groupGates
         self.layouts = layouts
+        self.tableTemplates = tableTemplates
         self.selectedLayoutID = selectedLayoutID
         self.lastGraphDisplayStates = lastGraphDisplayStates
         self.compensationMatrices = compensationMatrices
@@ -33,6 +36,7 @@ struct WorkspaceDocument: Codable, Sendable {
         case samples
         case groupGates
         case layouts
+        case tableTemplates
         case selectedLayoutID
         case lastGraphDisplayStates
         case compensationMatrices
@@ -44,6 +48,7 @@ struct WorkspaceDocument: Codable, Sendable {
         samples = try container.decode([WorkspaceSampleSnapshot].self, forKey: .samples)
         groupGates = try container.decode([WorkspaceGateSnapshot].self, forKey: .groupGates)
         layouts = try container.decode([WorkspaceLayout].self, forKey: .layouts)
+        tableTemplates = try container.decodeIfPresent([WorkspaceTableTemplate].self, forKey: .tableTemplates) ?? []
         selectedLayoutID = try container.decodeIfPresent(UUID.self, forKey: .selectedLayoutID)
         lastGraphDisplayStates = try container.decodeIfPresent(
             [String: WorkspaceGraphDisplayState].self,
@@ -61,6 +66,7 @@ struct WorkspaceDocument: Codable, Sendable {
         try container.encode(samples, forKey: .samples)
         try container.encode(groupGates, forKey: .groupGates)
         try container.encode(layouts, forKey: .layouts)
+        try container.encode(tableTemplates, forKey: .tableTemplates)
         try container.encodeIfPresent(selectedLayoutID, forKey: .selectedLayoutID)
         try container.encode(lastGraphDisplayStates, forKey: .lastGraphDisplayStates)
         try container.encode(compensationMatrices, forKey: .compensationMatrices)

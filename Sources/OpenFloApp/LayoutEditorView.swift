@@ -66,6 +66,7 @@ struct LayoutEditorView: View {
             }
             Menu("Object") {
                 Button("Text") { addTextBox() }
+                Button("Live Statistic") { addStatisticObject() }
                 Button("Rectangle") { addShape(.rectangle) }
                 Button("Oval") { addShape(.oval) }
                 Button("Line") { addShape(.line) }
@@ -467,14 +468,18 @@ struct LayoutEditorView: View {
             switch item.wrappedValue.kind {
             case .plot:
                 plotProperties(item: item)
-            case .text:
+            case .text, .fjmlText:
                 textProperties(item: item)
             case .shape:
                 shapeProperties(item: item)
             case .table:
-                Text("The statistics table placeholder is included in exports and batch layouts.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                reportTableProperties(item: item)
+            case .statistic:
+                statisticProperties(item: item)
+            case .reportTable:
+                reportTableProperties(item: item)
+            case .populationTable:
+                populationTableProperties(item: item)
             }
 
             Button(role: .destructive) {
@@ -538,6 +543,14 @@ struct LayoutEditorView: View {
                     Text(mode.rawValue).tag(mode)
                 }
             }
+
+            Toggle("Smooth histogram", isOn: Binding<Bool>(
+                get: { descriptor.wrappedValue.histogramSmooth },
+                set: { descriptor.wrappedValue.histogramSmooth = $0 }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(descriptor.wrappedValue.plotMode != .histogram)
+            .opacity(descriptor.wrappedValue.plotMode == .histogram ? 1 : 0.45)
 
             axisControl("X Axis", selection: Binding<String>(
                 get: { descriptor.wrappedValue.xChannelName ?? channels.first ?? "" },
@@ -661,12 +674,98 @@ struct LayoutEditorView: View {
         TextEditor(text: Binding<String>(
             get: {
                 if case .text(let text) = item.wrappedValue.kind { return text }
+                if case .fjmlText(let object) = item.wrappedValue.kind {
+                    return object.segments.map { segment in
+                        switch segment {
+                        case .literal(let text): return text
+                        case .keyword(let keyword): return "<Keyword key=\"\(keyword.key)\"/>"
+                        case .statistic(let column): return "<Statistic column=\"\(column.name)\"/>"
+                        case .equation(let expression): return "<Equation>\(expression)</Equation>"
+                        case .annotation(let annotation): return "<Annotation type=\"\(annotation.rawValue)\"/>"
+                        }
+                    }.joined()
+                }
                 return ""
             },
             set: { item.wrappedValue.kind = .text($0) }
         ))
         .frame(height: 120)
         .overlay(Rectangle().stroke(Color.black.opacity(0.18), lineWidth: 1))
+    }
+
+    private func statisticProperties(item: Binding<WorkspaceLayoutItem>) -> some View {
+        let object = layoutStatisticBinding(item)
+        let column = Binding<WorkspaceTableColumn>(
+            get: { object.wrappedValue.column },
+            set: { object.wrappedValue.column = $0 }
+        )
+        let names = workspace.availableStatisticChannelNames(for: column.wrappedValue.sourceSelection)
+        return VStack(alignment: .leading, spacing: 10) {
+            TextField("Label", text: Binding<String>(
+                get: { object.wrappedValue.label },
+                set: { object.wrappedValue.label = $0 }
+            ))
+            .textFieldStyle(.roundedBorder)
+
+            Toggle("Show label", isOn: Binding<Bool>(
+                get: { object.wrappedValue.showLabel },
+                set: { object.wrappedValue.showLabel = $0 }
+            ))
+
+            Picker("Statistic", selection: Binding<WorkspaceStatisticKind>(
+                get: { column.wrappedValue.statistic },
+                set: { column.wrappedValue.statistic = $0 }
+            )) {
+                ForEach(WorkspaceStatisticKind.allCases) { statistic in
+                    Text(statistic.rawValue).tag(statistic)
+                }
+            }
+
+            if column.wrappedValue.statistic.requiresChannel {
+                Picker("Channel", selection: Binding<String>(
+                    get: { column.wrappedValue.channelName ?? names.first ?? "" },
+                    set: { column.wrappedValue.channelName = $0.isEmpty ? nil : $0 }
+                )) {
+                    ForEach(names, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+            }
+
+            if column.wrappedValue.statistic.requiresPercentile {
+                TextField(
+                    "Percentile",
+                    value: Binding<Double>(
+                        get: { column.wrappedValue.percentile ?? 50 },
+                        set: { column.wrappedValue.percentile = $0 }
+                    ),
+                    format: .number
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+
+    private func reportTableProperties(item: Binding<WorkspaceLayoutItem>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Live table using the same report evaluator as Table Editor.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Add Count Column") {
+                var object = layoutTableObject(from: item.wrappedValue.kind)
+                if case .template(var columns) = object.source {
+                    columns.append(WorkspaceTableColumn(sourceSelection: nil, gatePath: [], name: "Count", statistic: .count))
+                    object.source = .template(columns)
+                    item.wrappedValue.kind = .reportTable(object)
+                }
+            }
+        }
+    }
+
+    private func populationTableProperties(item: Binding<WorkspaceLayoutItem>) -> some View {
+        Text("Population tables show populations as rows and statistics as columns for the current sample.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
     private func shapeProperties(item: Binding<WorkspaceLayoutItem>) -> some View {
@@ -823,6 +922,29 @@ struct LayoutEditorView: View {
         )
     }
 
+    private func layoutStatisticBinding(_ item: Binding<WorkspaceLayoutItem>) -> Binding<LayoutStatisticObject> {
+        Binding(
+            get: {
+                if case .statistic(let object) = item.wrappedValue.kind {
+                    return object
+                }
+                return defaultLayoutStatisticObject()
+            },
+            set: { item.wrappedValue.kind = .statistic($0) }
+        )
+    }
+
+    private func layoutTableObject(from kind: LayoutItemKind) -> LayoutTableObject {
+        switch kind {
+        case .reportTable(let object):
+            return object
+        case .table:
+            return LayoutTableObject()
+        default:
+            return LayoutTableObject()
+        }
+    }
+
     private func insert(_ tool: LayoutCanvasTool) {
         switch tool {
         case .cursor:
@@ -846,6 +968,15 @@ struct LayoutEditorView: View {
         selectedItemID = item.id
     }
 
+    private func addStatisticObject() {
+        let item = WorkspaceLayoutItem(
+            frame: LayoutFrame(x: 460, y: 300, width: 260, height: 70),
+            kind: .statistic(defaultLayoutStatisticObject())
+        )
+        workspace.addLayoutItem(item)
+        selectedItemID = item.id
+    }
+
     private func addShape(_ shape: LayoutShapeKind) {
         let item = WorkspaceLayoutItem(frame: .defaultShape, kind: .shape(shape), fillColorName: shape == .line ? "None" : "Light Teal")
         workspace.addLayoutItem(item)
@@ -853,9 +984,28 @@ struct LayoutEditorView: View {
     }
 
     private func addTablePlaceholder() {
-        let item = WorkspaceLayoutItem(frame: LayoutFrame(x: 460, y: 350, width: 330, height: 150), kind: .table)
+        let item = WorkspaceLayoutItem(
+            frame: LayoutFrame(x: 460, y: 350, width: 360, height: 170),
+            kind: .reportTable(LayoutTableObject())
+        )
         workspace.addLayoutItem(item)
         selectedItemID = item.id
+    }
+
+    private func defaultLayoutStatisticObject() -> LayoutStatisticObject {
+        let selection = workspace.selected
+        let path = selection.map { workspace.gatePathNames(for: $0) } ?? []
+        let name = path.last ?? "Statistic"
+        return LayoutStatisticObject(
+            column: WorkspaceTableColumn(
+                sourceSelection: selection,
+                gatePath: path,
+                name: name,
+                statistic: .frequencyOfParent,
+                channelName: selection.flatMap { workspace.availableStatisticChannelNames(for: $0).first }
+            ),
+            label: name
+        )
     }
 
     private func addPlots(fromDragPayload payload: String, at position: CGPoint?) {
@@ -1257,10 +1407,18 @@ private struct LayoutCanvasItemView: View {
                 .padding(8)
                 .background(Color.white.opacity(0.92))
                 .overlay(Rectangle().stroke(Color.black.opacity(0.35), lineWidth: 1))
+        case .fjmlText(let object):
+            LayoutFJMLTextView(workspace: workspace, object: object, iterationSampleID: iterationSampleID)
         case .shape(let shape):
             LayoutShapeView(shape: shape, item: item)
         case .table:
-            LayoutTablePlaceholderView(workspace: workspace)
+            LayoutReportTableView(workspace: workspace, object: LayoutTableObject(), iterationSampleID: iterationSampleID)
+        case .statistic(let object):
+            LayoutStatisticItemView(workspace: workspace, object: object, iterationSampleID: iterationSampleID)
+        case .reportTable(let object):
+            LayoutReportTableView(workspace: workspace, object: object, iterationSampleID: iterationSampleID)
+        case .populationTable(let object):
+            LayoutPopulationTableView(workspace: workspace, object: object, iterationSampleID: iterationSampleID)
         }
     }
 
@@ -1636,7 +1794,7 @@ private struct LayoutPlotImageFrame: View {
             ZStack(alignment: .topLeading) {
                 Image(nsImage: image)
                     .resizable()
-                    .interpolation(.none)
+                    .interpolation(descriptor.plotMode.isOneDimensional ? .high : .none)
                     .frame(width: plotRect.width, height: plotRect.height)
                     .position(x: plotRect.midX, y: plotRect.midY)
 
@@ -1924,6 +2082,233 @@ private struct LayoutShapeView: View {
             context.stroke(path, with: .color(stroke), lineWidth: item.lineWidth)
         }
     }
+}
+
+private struct LayoutFJMLTextView: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let object: LayoutTextObject
+    let iterationSampleID: UUID?
+
+    var body: some View {
+        Text(renderedText)
+            .font(.system(size: object.style.fontSize))
+            .foregroundStyle(color(named: object.style.colorName))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(8)
+            .background(Color.white.opacity(0.92))
+            .overlay(Rectangle().stroke(Color.black.opacity(0.35), lineWidth: 1))
+    }
+
+    private var renderedText: String {
+        object.segments.map { segment in
+            switch segment {
+            case .literal(let text):
+                return text
+            case .keyword(let keyword):
+                let column = WorkspaceTableColumn(
+                    columnType: .keyword,
+                    sourceSelection: nil,
+                    gatePath: [],
+                    name: keyword.key,
+                    keyword: keyword
+                )
+                return firstValue(columns: [column])
+            case .statistic(let column):
+                return firstValue(columns: [column])
+            case .equation(let expression):
+                return ReportFormulaEngine.evaluate(expression) { _ in nil }.displayString
+            case .annotation(let annotation):
+                return annotationText(annotation)
+            }
+        }.joined()
+    }
+
+    private func firstValue(columns: [WorkspaceTableColumn]) -> String {
+        let ids = iterationSampleID.map { Set([$0]) }
+        return workspace.tableOutput(for: columns, sampleIDs: ids).rows.first?.values.first?.displayString ?? ""
+    }
+
+    private func annotationText(_ annotation: LayoutAnnotation) -> String {
+        switch annotation {
+        case .date:
+            return DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .none)
+        case .time:
+            return DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        case .version:
+            return "OpenFlo"
+        }
+    }
+}
+
+private struct LayoutStatisticItemView: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let object: LayoutStatisticObject
+    let iterationSampleID: UUID?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if object.showLabel {
+                Text(object.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text(value)
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .foregroundStyle(.black)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color.white.opacity(0.94))
+        .overlay(Rectangle().stroke(Color.black.opacity(0.35), lineWidth: 1))
+    }
+
+    private var value: String {
+        let ids = iterationSampleID.map { Set([$0]) }
+        return workspace.tableOutput(for: [object.column], sampleIDs: ids).rows.first?.values.first?.displayString ?? ""
+    }
+}
+
+private struct LayoutReportTableView: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let object: LayoutTableObject
+    let iterationSampleID: UUID?
+
+    var body: some View {
+        let output = tableOutput
+        let visible = visibleColumnIndices(output)
+        VStack(alignment: .leading, spacing: 0) {
+            if object.style.showHeader {
+                HStack(spacing: 0) {
+                    tableCell("Sample", weight: .semibold, alignment: .leading)
+                    ForEach(visible, id: \.self) { index in
+                        tableCell(output.columns[index].name, weight: .semibold)
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
+
+            ForEach(output.rows.prefix(10)) { row in
+                HStack(spacing: 0) {
+                    tableCell(row.sampleName, alignment: .leading)
+                    ForEach(visible, id: \.self) { index in
+                        let value = row.values.indices.contains(index) ? row.values[index].displayString : ""
+                        tableCell(value)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: object.style.fontSize))
+        .background(Color.white)
+        .overlay(Rectangle().stroke(Color.black.opacity(0.45), lineWidth: object.style.showGrid ? 1 : 0))
+    }
+
+    private var tableOutput: WorkspaceTableOutput {
+        let ids = iterationSampleID.map { Set([$0]) }
+        switch object.source {
+        case .template(let columns):
+            return workspace.tableOutput(for: columns, sampleIDs: ids)
+        case .snapshot(let snapshot):
+            let columns = snapshot.columns
+            let rows = snapshot.rows.map { row in
+                WorkspaceTableOutputRow(sampleName: row.sampleName, values: row.values.map(ReportValue.string))
+            }
+            return WorkspaceTableOutput(columns: columns, rows: rows)
+        }
+    }
+
+    private func tableCell(
+        _ text: String,
+        weight: Font.Weight = .regular,
+        alignment: Alignment = .trailing
+    ) -> some View {
+        Text(text)
+            .fontWeight(weight)
+            .lineLimit(1)
+            .minimumScaleFactor(0.65)
+            .monospacedDigit()
+            .frame(width: 104, height: 22, alignment: alignment)
+            .padding(.horizontal, 5)
+            .overlay(Rectangle().stroke(Color.black.opacity(object.style.showGrid ? 0.16 : 0), lineWidth: 1))
+    }
+}
+
+private struct LayoutPopulationTableView: View {
+    @ObservedObject var workspace: WorkspaceModel
+    let object: LayoutPopulationTableObject
+    let iterationSampleID: UUID?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                tableCell("Population", weight: .semibold, alignment: .leading)
+                ForEach(Array(object.statistics.indices), id: \.self) { index in
+                    tableCell(object.statistics[index].kind.rawValue, weight: .semibold)
+                }
+            }
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            ForEach(populations.indices, id: \.self) { index in
+                HStack(spacing: 0) {
+                    tableCell(populationName(populations[index]), alignment: .leading)
+                    ForEach(Array(object.statistics.indices), id: \.self) { statIndex in
+                        tableCell(value(population: populations[index], statistic: object.statistics[statIndex]))
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: object.style.fontSize))
+        .background(Color.white)
+        .overlay(Rectangle().stroke(Color.black.opacity(0.45), lineWidth: object.style.showGrid ? 1 : 0))
+    }
+
+    private var populations: [PopulationReference] {
+        object.populations.isEmpty ? [PopulationReference(pathNames: [])] : object.populations
+    }
+
+    private func value(population: PopulationReference, statistic: StatisticRequest) -> String {
+        var column = WorkspaceTableColumn(
+            sourceSelection: nil,
+            gatePath: population.pathNames,
+            name: statistic.kind.rawValue,
+            statistic: statistic.kind,
+            channelName: statistic.channelName,
+            percentile: statistic.percentile,
+            statisticSpace: statistic.space
+        )
+        column.denominatorGatePath = statistic.denominator?.pathNames ?? []
+        let sampleID = object.sampleID ?? iterationSampleID
+        let output = workspace.tableOutput(for: [column], sampleIDs: sampleID.map { Set([$0]) })
+        return output.rows.first?.values.first?.displayString ?? ""
+    }
+
+    private func populationName(_ population: PopulationReference) -> String {
+        population.pathNames.last ?? "All Events"
+    }
+
+    private func tableCell(
+        _ text: String,
+        weight: Font.Weight = .regular,
+        alignment: Alignment = .trailing
+    ) -> some View {
+        Text(text)
+            .fontWeight(weight)
+            .lineLimit(1)
+            .minimumScaleFactor(0.65)
+            .monospacedDigit()
+            .frame(width: 104, height: 22, alignment: alignment)
+            .padding(.horizontal, 5)
+            .overlay(Rectangle().stroke(Color.black.opacity(object.style.showGrid ? 0.16 : 0), lineWidth: 1))
+    }
+}
+
+private func visibleColumnIndices(_ output: WorkspaceTableOutput) -> [Int] {
+    output.columns.indices.filter { output.columns[$0].showValues }
 }
 
 private struct LayoutTablePlaceholderView: View {

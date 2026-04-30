@@ -81,7 +81,7 @@ struct ScatterPlotView: View {
                 if let image {
                     Image(nsImage: image)
                         .resizable()
-                        .interpolation(.none)
+                        .interpolation(plotMode.isOneDimensional ? .high : .none)
                         .frame(width: plotRect.width, height: plotRect.height)
                         .position(x: plotRect.midX, y: plotRect.midY)
                 }

@@ -113,6 +113,7 @@ struct LayoutPlotRenderPayload: Sendable {
     let xAxisSettings: AxisDisplaySettings
     let yAxisSettings: AxisDisplaySettings
     let mode: PlotMode
+    let histogramSmooth: Bool
     let ancestry: [String]
 }
 
@@ -230,6 +231,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var autoApplyAcquisitionCompensation = true
     @Published var selected: WorkspaceSelection?
     @Published var layouts: [WorkspaceLayout] = [WorkspaceLayout(name: "Layout")]
+    @Published var tableTemplates: [WorkspaceTableTemplate] = []
     @Published var selectedLayoutID: UUID?
     @Published private(set) var status: String = "Drop .fcs or single-cell files here or add samples."
     @Published private(set) var progress: WorkspaceProgress?
@@ -560,6 +562,7 @@ final class WorkspaceModel: ObservableObject {
         compensationMatrices.removeAll()
         selected = nil
         layouts = [WorkspaceLayout(name: "Layout")]
+        tableTemplates.removeAll()
         selectedLayoutID = layouts.first?.id
         lastCreatedGate = nil
         layoutPlotSnapshotCache.removeAll()
@@ -611,6 +614,7 @@ final class WorkspaceModel: ObservableObject {
             },
             groupGates: groupGates.map { WorkspaceGateSnapshot(node: $0) },
             layouts: layouts,
+            tableTemplates: tableTemplates,
             selectedLayoutID: selectedLayoutID,
             lastGraphDisplayStates: lastGraphDisplayStateBySelectionKey,
             compensationMatrices: compensationMatrices
@@ -707,6 +711,7 @@ final class WorkspaceModel: ObservableObject {
                     self.samples = loadedSamples
                     self.compensationMatrices = loadedMatrices
                     self.layouts = document.layouts.isEmpty ? [WorkspaceLayout(name: "Layout")] : document.layouts
+                    self.tableTemplates = document.tableTemplates
                     self.selectedLayoutID = document.selectedLayoutID ?? self.layouts.first?.id
                     self.selected = self.samples.first.map { WorkspaceSelection(sampleID: $0.id, gateID: nil) }
                     for sample in self.samples {
@@ -1402,17 +1407,8 @@ final class WorkspaceModel: ObservableObject {
         if copyCompensation(dragPayload: dragPayload, to: target) {
             return
         }
-        let gateIDs: [UUID]
-        if dragPayload.hasPrefix("gates:") {
-            gateIDs = dragPayload
-                .dropFirst(6)
-                .split(separator: ",")
-                .compactMap { UUID(uuidString: String($0)) }
-        } else if dragPayload.hasPrefix("gate:"), let gateID = UUID(uuidString: String(dragPayload.dropFirst(5))) {
-            gateIDs = [gateID]
-        } else {
-            return
-        }
+        let gateIDs = gateIDs(fromDragPayload: dragPayload)
+        guard !gateIDs.isEmpty else { return }
         if target.isAllSamples {
             copyGatesToAllSamples(gateIDs, target: target)
             return
@@ -1650,7 +1646,8 @@ final class WorkspaceModel: ObservableObject {
         yChannelName: String?,
         plotMode: PlotMode,
         xAxisSettings: AxisDisplaySettings?,
-        yAxisSettings: AxisDisplaySettings?
+        yAxisSettings: AxisDisplaySettings?,
+        histogramSmooth: Bool
     ) {
         guard contains(selection) else { return }
         lastGraphDisplayStateBySelectionKey[selectionKey(selection)] = WorkspaceGraphDisplayState(
@@ -1658,7 +1655,8 @@ final class WorkspaceModel: ObservableObject {
             yChannelName: yChannelName,
             plotMode: plotMode,
             xAxisSettings: xAxisSettings,
-            yAxisSettings: yAxisSettings
+            yAxisSettings: yAxisSettings,
+            histogramSmooth: histogramSmooth
         )
         layoutPlotSnapshotCache.removeAll()
     }
@@ -1876,7 +1874,7 @@ final class WorkspaceModel: ObservableObject {
                 sourceSelection: selection,
                 gatePath: path,
                 name: name,
-                statistic: .count,
+                statistic: .frequencyOfParent,
                 channelName: defaultStatisticChannelName(for: selection)
             )
         }
@@ -1986,14 +1984,44 @@ final class WorkspaceModel: ObservableObject {
         return WorkspaceChannelOptions(names: names, totalCount: table.channelCount, isLimited: true)
     }
 
-    func tableOutput(for columns: [WorkspaceTableColumn]) -> WorkspaceTableOutput {
-        let rows = samples.map { sample in
-            WorkspaceTableOutputRow(
+    func tableOutput(for columns: [WorkspaceTableColumn], sampleIDs: Set<UUID>? = nil) -> WorkspaceTableOutput {
+        let formulaPlan = formulaEvaluationPlan(for: columns)
+        var controlValues: [Int: ReportValue] = [:]
+        let tableSamples = sampleIDs.map { ids in samples.filter { ids.contains($0.id) } } ?? samples
+        let rows = tableSamples.enumerated().map { rowIndex, sample in
+            var values = columns.map { tableValue(for: $0, sample: sample) }
+            if rowIndex == 0 {
+                for index in columns.indices where columns[index].defineAsControl {
+                    controlValues[index] = values[index]
+                }
+            } else {
+                for (index, value) in controlValues {
+                    values[index] = value
+                }
+            }
+
+            for index in formulaPlan.recursiveIndices {
+                values[index] = .error("Recursive formula dependency")
+            }
+
+            for index in formulaPlan.order where !formulaPlan.recursiveIndices.contains(index) {
+                values[index] = formulaValue(for: columns[index], columns: columns, values: values)
+            }
+
+            return WorkspaceTableOutputRow(
                 sampleName: sample.name,
-                values: columns.map { tableValue(for: $0, sample: sample) }
+                values: values
             )
         }
         return WorkspaceTableOutput(columns: columns, rows: rows)
+    }
+
+    func saveTableTemplate(name: String, columns: [WorkspaceTableColumn]) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedName = trimmed.isEmpty ? "Table \(tableTemplates.count + 1)" : trimmed
+        let template = WorkspaceTableTemplate(name: resolvedName, columns: columns)
+        tableTemplates.append(template)
+        status = "Saved table template \(resolvedName)."
     }
 
     func plotDescriptor(for selection: WorkspaceSelection) -> WorkspacePlotDescriptor? {
@@ -2200,6 +2228,7 @@ final class WorkspaceModel: ObservableObject {
                 xAxisSettings: xSettings,
                 yAxisSettings: ySettings,
                 mode: descriptor.plotMode,
+                histogramSmooth: descriptor.histogramSmooth,
                 ancestry: path.map(\.name)
             ))
         }
@@ -2217,6 +2246,7 @@ final class WorkspaceModel: ObservableObject {
             xAxisSettings: xSettings,
             yAxisSettings: ySettings,
             mode: descriptor.plotMode,
+            histogramSmooth: descriptor.histogramSmooth,
             ancestry: path.map(\.name)
         ))
     }
@@ -2336,6 +2366,7 @@ final class WorkspaceModel: ObservableObject {
         xAxisSettings: AxisDisplaySettings,
         yAxisSettings: AxisDisplaySettings,
         mode: PlotMode,
+        histogramSmooth: Bool,
         ancestry: [String]
     ) -> LayoutPlotRenderPayload {
         let maxRows = 4_000
@@ -2371,6 +2402,7 @@ final class WorkspaceModel: ObservableObject {
             xAxisSettings: xAxisSettings,
             yAxisSettings: yAxisSettings,
             mode: mode,
+            histogramSmooth: histogramSmooth,
             ancestry: ancestry
         )
     }
@@ -2390,13 +2422,13 @@ final class WorkspaceModel: ObservableObject {
         let displayYRange: ClosedRange<Float>
 
         if mode.isOneDimensional {
-            let histogram = Histogram1D.build(values: xValues, mask: mask, width: 420, xRange: xRange)
+            let histogram = Histogram1D.build(values: xValues, mask: mask, width: AppModel.histogramBinCount, xRange: xRange)
             if mode == .cdf {
                 displayYRange = 0...1
                 image = CDFRenderer.image(from: histogram, yRange: displayYRange)
             } else {
-                displayYRange = AppModel.histogramPreviewRange(maxBin: histogram.maxBin)
-                image = HistogramRenderer.image(from: histogram, height: 420, yRange: displayYRange)
+                displayYRange = AppModel.histogramPreviewRange(displayMaximum: HistogramRenderer.displayMaximum(for: histogram, smooth: payload.histogramSmooth))
+                image = HistogramRenderer.image(from: histogram, width: 420, height: 420, yRange: displayYRange, smooth: payload.histogramSmooth)
             }
         } else if mode == .dot {
             displayYRange = yRange
@@ -2474,13 +2506,13 @@ final class WorkspaceModel: ObservableObject {
         let displayYRange: ClosedRange<Float>
 
         if mode.isOneDimensional {
-            let histogram = Histogram1D.build(values: xValues, mask: sampledMask, width: 420, xRange: xRange)
+            let histogram = Histogram1D.build(values: xValues, mask: sampledMask, width: AppModel.histogramBinCount, xRange: xRange)
             if mode == .cdf {
                 displayYRange = 0...1
                 image = CDFRenderer.image(from: histogram, yRange: displayYRange)
             } else {
-                displayYRange = AppModel.histogramPreviewRange(maxBin: histogram.maxBin)
-                image = HistogramRenderer.image(from: histogram, height: 420, yRange: displayYRange)
+                displayYRange = AppModel.histogramPreviewRange(displayMaximum: HistogramRenderer.displayMaximum(for: histogram, smooth: payload.histogramSmooth))
+                image = HistogramRenderer.image(from: histogram, width: 420, height: 420, yRange: displayYRange, smooth: payload.histogramSmooth)
             }
         } else if mode == .dot {
             displayYRange = yRange
@@ -2676,6 +2708,7 @@ final class WorkspaceModel: ObservableObject {
             descriptor.xChannelName ?? "auto-x",
             descriptor.yChannelName ?? "auto-y",
             descriptor.plotMode.rawValue,
+            descriptor.histogramSmooth ? "smooth-histogram" : "raw-histogram",
             descriptor.showAxes ? "axes" : "no-axes",
             axisSettingsCacheKey(descriptor.xAxisSettings),
             axisSettingsCacheKey(descriptor.yAxisSettings),
@@ -2906,7 +2939,7 @@ final class WorkspaceModel: ObservableObject {
         if descriptor.plotMode.isOneDimensional {
             let histograms = series.map { item in
                 OverlayHistogramSeries(
-                    histogram: Histogram1D.build(values: item.xValues, mask: item.mask, width: 420, xRange: resolvedXRange),
+                    histogram: Histogram1D.build(values: item.xValues, mask: item.mask, width: AppModel.histogramBinCount, xRange: resolvedXRange),
                     colorName: item.colorName
                 )
             }
@@ -2914,9 +2947,9 @@ final class WorkspaceModel: ObservableObject {
                 resolvedYRange = 0...1
                 image = OverlayHistogramRenderer.image(series: histograms, height: 420, yRange: resolvedYRange, cumulative: true)
             } else {
-                let maxBin = histograms.map(\.histogram.maxBin).max() ?? 0
-                resolvedYRange = AppModel.histogramPreviewRange(maxBin: maxBin)
-                image = OverlayHistogramRenderer.image(series: histograms, height: 420, yRange: resolvedYRange)
+                let displayMaximum = histograms.map { HistogramRenderer.displayMaximum(for: $0.histogram, smooth: descriptor.histogramSmooth) }.max() ?? 1
+                resolvedYRange = AppModel.histogramPreviewRange(displayMaximum: displayMaximum)
+                image = OverlayHistogramRenderer.image(series: histograms, height: 420, yRange: resolvedYRange, smooth: descriptor.histogramSmooth)
             }
         } else {
             resolvedYRange = descriptor.yAxisSettings?.resolvedRange(auto: yRange ?? 0...1) ?? (yRange ?? 0...1)
@@ -3015,42 +3048,179 @@ final class WorkspaceModel: ObservableObject {
         return table.channels[axes.x].displayName
     }
 
-    private func tableValue(for column: WorkspaceTableColumn, sample: WorkspaceSample) -> Double? {
+    private func tableValue(for column: WorkspaceTableColumn, sample: WorkspaceSample) -> ReportValue {
+        switch column.columnType {
+        case .keyword:
+            return keywordValue(for: column.keyword, sample: sample)
+        case .formula:
+            return .missing
+        case .statistic:
+            return statisticValue(for: column, sample: sample)
+        }
+    }
+
+    private func statisticValue(for column: WorkspaceTableColumn, sample: WorkspaceSample) -> ReportValue {
         let path = column.gatePath.isEmpty ? [] : gatePathMatching(column.gatePath, in: sample.gates)
         if !column.gatePath.isEmpty, path.isEmpty {
-            return nil
+            return .missing
         }
         let mask = path.isEmpty
             ? EventMask(count: sample.table.rowCount, fill: true)
             : evaluate(path: path, sample: sample)
-        switch column.statistic {
-        case .count:
-            return Double(mask.selectedCount)
-        case .percentParent:
-            let parentCount = parentCount(for: path, sample: sample)
-            guard parentCount > 0 else { return nil }
-            return Double(mask.selectedCount) / Double(parentCount) * 100
-        case .percentTotal:
-            guard sample.table.rowCount > 0 else { return nil }
-            return Double(mask.selectedCount) / Double(sample.table.rowCount) * 100
-        case .median, .mean, .geometricMean:
-            guard let channelIndex = statisticChannelIndex(named: column.channelName, in: sample.table) else { return nil }
-            let values = selectedFiniteValues(sample.table.column(channelIndex), mask: mask)
-            guard !values.isEmpty else { return nil }
-            switch column.statistic {
-            case .median:
-                return Double(median(values))
-            case .mean:
-                return Double(values.reduce(Float(0), +) / Float(values.count))
-            case .geometricMean:
-                let positive = values.filter { $0 > 0 }
-                guard !positive.isEmpty else { return nil }
-                let logMean = positive.map { log(Double($0)) }.reduce(0, +) / Double(positive.count)
-                return exp(logMean)
-            case .count, .percentParent, .percentTotal:
-                return nil
+        let parent = parentMask(for: path, sample: sample)
+        let grandparent = grandparentMask(for: path, sample: sample)
+        let denominator = denominatorMask(for: column, sample: sample)
+        let channelName = column.statistic.requiresChannel
+            ? column.channelName ?? sample.table.channels[AppModel.defaultAxisSelection(for: sample.table).x].displayName
+            : column.channelName
+        let request = StatisticRequest(
+            kind: column.statistic,
+            channelName: channelName,
+            percentile: column.percentile,
+            denominator: column.denominatorGatePath.isEmpty ? nil : PopulationReference(pathNames: column.denominatorGatePath),
+            space: column.statisticSpace
+        )
+        return ReportValue(
+            StatisticEngine.evaluate(
+                request: request,
+                table: sample.table,
+                population: mask,
+                parent: parent,
+                grandparent: grandparent,
+                denominator: denominator,
+                totalCount: sample.table.rowCount,
+                channelResolver: { statisticChannelIndex(named: $0, in: sample.table) }
+            )
+        )
+    }
+
+    private func keywordValue(for keyword: KeywordColumnSpec, sample: WorkspaceSample) -> ReportValue {
+        let key = keyword.key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return .missing }
+        switch keyword.scope {
+        case .sample:
+            return keywordLookup(key, in: sample.metadata?.keywords) ?? derivedSampleKeyword(key, sample: sample)
+        case .parameter:
+            guard let parameterName = keyword.parameterName,
+                  let channel = sample.table.channels.first(where: { $0.displayName == parameterName || $0.name == parameterName }) else {
+                return .missing
+            }
+            switch key.uppercased() {
+            case "$PNN", "PNN", "NAME":
+                return .string(channel.name)
+            case "$PNS", "PNS", "MARKER":
+                return channel.markerName.map(ReportValue.string) ?? .missing
+            case "FLUOROCHROME":
+                return channel.fluorochromeName.map(ReportValue.string) ?? .missing
+            default:
+                return keywordLookup(key, in: sample.metadata?.keywords) ?? .missing
+            }
+        case .workspace:
+            if key.caseInsensitiveCompare("Sample Count") == .orderedSame {
+                return .number(Double(samples.count))
+            }
+            return .missing
+        case .derived:
+            return derivedSampleKeyword(key, sample: sample)
+        }
+    }
+
+    private func keywordLookup(_ key: String, in keywords: [String: String]?) -> ReportValue? {
+        guard let keywords else { return nil }
+        let variants = [
+            key,
+            key.uppercased(),
+            key.hasPrefix("$") ? String(key.dropFirst()) : "$\(key)"
+        ]
+        for variant in variants {
+            if let value = keywords[variant] ?? keywords[variant.uppercased()] {
+                return .string(value)
             }
         }
+        return nil
+    }
+
+    private func derivedSampleKeyword(_ key: String, sample: WorkspaceSample) -> ReportValue {
+        switch key.lowercased() {
+        case "sample", "sample name", "name":
+            return .string(sample.name)
+        case "events", "cells", "row count", "total":
+            return .number(Double(sample.table.rowCount))
+        case "kind":
+            return .string(sample.kind.rawValue)
+        case "file", "filename":
+            return .string(sample.url?.lastPathComponent ?? sample.name)
+        default:
+            return .missing
+        }
+    }
+
+    private func parentMask(for path: [WorkspaceGateNode], sample: WorkspaceSample) -> EventMask? {
+        guard path.count > 1 else {
+            return EventMask(count: sample.table.rowCount, fill: true)
+        }
+        return evaluate(path: Array(path.dropLast()), sample: sample)
+    }
+
+    private func grandparentMask(for path: [WorkspaceGateNode], sample: WorkspaceSample) -> EventMask? {
+        guard path.count > 2 else {
+            return EventMask(count: sample.table.rowCount, fill: true)
+        }
+        return evaluate(path: Array(path.dropLast(2)), sample: sample)
+    }
+
+    private func denominatorMask(for column: WorkspaceTableColumn, sample: WorkspaceSample) -> EventMask? {
+        guard !column.denominatorGatePath.isEmpty else { return nil }
+        let denominatorPath = gatePathMatching(column.denominatorGatePath, in: sample.gates)
+        guard !denominatorPath.isEmpty else { return nil }
+        return evaluate(path: denominatorPath, sample: sample)
+    }
+
+    private func formulaValue(
+        for column: WorkspaceTableColumn,
+        columns: [WorkspaceTableColumn],
+        values: [ReportValue]
+    ) -> ReportValue {
+        ReportFormulaEngine.evaluate(column.formula.expression) { name in
+            if let index = columns.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }),
+               values.indices.contains(index) {
+                return values[index]
+            }
+            return nil
+        }
+    }
+
+    private func formulaEvaluationPlan(for columns: [WorkspaceTableColumn]) -> (order: [Int], recursiveIndices: Set<Int>) {
+        let formulaIndices = columns.indices.filter { columns[$0].columnType == .formula }
+        var visited = Set<Int>()
+        var stack: [Int] = []
+        var recursiveIndices = Set<Int>()
+        var output: [Int] = []
+
+        func visit(_ index: Int) {
+            if let cycleStart = stack.firstIndex(of: index) {
+                recursiveIndices.formUnion(stack[cycleStart...])
+                recursiveIndices.insert(index)
+                return
+            }
+            guard !visited.contains(index) else { return }
+            stack.append(index)
+            let references = ReportFormulaEngine.referencedColumnNames(in: columns[index].formula.expression)
+            for reference in references {
+                if let dependencyIndex = columns.firstIndex(where: { $0.name.caseInsensitiveCompare(reference) == .orderedSame }),
+                   columns[dependencyIndex].columnType == .formula {
+                    visit(dependencyIndex)
+                }
+            }
+            _ = stack.popLast()
+            visited.insert(index)
+            output.append(index)
+        }
+
+        for index in formulaIndices {
+            visit(index)
+        }
+        return (output, recursiveIndices)
     }
 
     private func gatePathMatching(_ names: [String], in gates: [WorkspaceGateNode]) -> [WorkspaceGateNode] {
@@ -3067,11 +3237,6 @@ final class WorkspaceModel: ObservableObject {
         return []
     }
 
-    private func parentCount(for path: [WorkspaceGateNode], sample: WorkspaceSample) -> Int {
-        guard path.count > 1 else { return sample.table.rowCount }
-        return evaluate(path: Array(path.dropLast()), sample: sample).selectedCount
-    }
-
     private func statisticChannelIndex(named name: String?, in table: EventTable) -> Int? {
         if let name, let index = channelIndex(named: name, in: table) {
             return index
@@ -3083,28 +3248,6 @@ final class WorkspaceModel: ObservableObject {
             }
         }
         return AppModel.defaultAxisSelection(for: table).x
-    }
-
-    private func selectedFiniteValues(_ values: [Float], mask: EventMask) -> [Float] {
-        guard mask.count == values.count else { return [] }
-        var output: [Float] = []
-        output.reserveCapacity(mask.selectedCount)
-        for index in values.indices where mask[index] {
-            let value = values[index]
-            if value.isFinite {
-                output.append(value)
-            }
-        }
-        return output
-    }
-
-    private func median(_ values: [Float]) -> Float {
-        let sorted = values.sorted()
-        let middle = sorted.count / 2
-        if sorted.count.isMultiple(of: 2) {
-            return (sorted[middle - 1] + sorted[middle]) / 2
-        }
-        return sorted[middle]
     }
 
     private func tableForSelection(_ selection: WorkspaceSelection?) -> EventTable? {

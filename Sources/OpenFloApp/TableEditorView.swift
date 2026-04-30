@@ -11,6 +11,7 @@ struct TableEditorView: View {
     @State private var displayTarget: TableDisplayTarget = .display
     @State private var fileFormat: TableFileFormat = .text
     @State private var destinationURL: URL?
+    @State private var templateName = "Table Template"
     @State private var status = "Drag populations or gates from the workspace."
 
     var body: some View {
@@ -39,12 +40,59 @@ struct TableEditorView: View {
 
             VStack(spacing: 7) {
                 HStack(spacing: 6) {
+                    Menu {
+                        if workspace.tableTemplates.isEmpty {
+                            Text("No saved templates")
+                        } else {
+                            ForEach(workspace.tableTemplates) { template in
+                                Button(template.name) {
+                                    columns = template.columns
+                                    selectedColumnIDs.removeAll()
+                                    templateName = template.name
+                                    status = "Loaded \(template.name)."
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Load", systemImage: "tray.and.arrow.down")
+                    }
+
+                    Button {
+                        workspace.saveTableTemplate(name: templateName, columns: columns)
+                        status = "Saved \(templateName)."
+                    } label: {
+                        Label("Save", systemImage: "tray.and.arrow.up")
+                    }
+                    .disabled(columns.isEmpty)
+                }
+
+                TextField("Template name", text: $templateName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 170)
+            }
+
+            Divider()
+                .frame(height: 62)
+
+            VStack(spacing: 7) {
+                HStack(spacing: 6) {
                     Button {
                         addWorkspaceSelection()
                     } label: {
-                        Label("Add", systemImage: "plus")
+                        Label("Statistic", systemImage: "plus")
                     }
-                    .disabled(workspace.selected?.gateID == nil)
+
+                    Button {
+                        addKeywordColumn()
+                    } label: {
+                        Label("Keyword", systemImage: "tag")
+                    }
+
+                    Button {
+                        addFormulaColumn()
+                    } label: {
+                        Label("Formula", systemImage: "function")
+                    }
 
                     Button {
                         duplicateSelectedRows()
@@ -146,12 +194,16 @@ struct TableEditorView: View {
 
     private var columnHeader: some View {
         HStack(spacing: 8) {
+            Text("Type")
+                .frame(width: 105, alignment: .leading)
             Text("Name")
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text("Statistic")
-                .frame(width: 160, alignment: .leading)
-            Text("Parameter")
-                .frame(width: 230, alignment: .leading)
+            Text("Definition")
+                .frame(width: 420, alignment: .leading)
+            Text("Show")
+                .frame(width: 52, alignment: .center)
+            Text("Control")
+                .frame(width: 66, alignment: .center)
             Text("Heat")
                 .frame(width: 58, alignment: .center)
         }
@@ -165,22 +217,28 @@ struct TableEditorView: View {
         List(selection: $selectedColumnIDs) {
             ForEach($columns) { $column in
                 HStack(spacing: 8) {
+                    Picker("", selection: $column.columnType) {
+                        ForEach(ReportColumnType.allCases) { type in
+                            Text(type.rawValue).tag(type)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 105)
+
                     TextField("Column Name", text: $column.name)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: .infinity)
 
-                    Picker("", selection: $column.statistic) {
-                        ForEach(WorkspaceStatisticKind.allCases) { statistic in
-                            Text(statistic.rawValue).tag(statistic)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 160)
+                    columnDefinition(column: $column)
+                        .frame(width: 420)
 
-                    parameterPicker(column: $column)
-                        .frame(width: 230)
-                        .disabled(!column.statistic.requiresChannel)
-                        .opacity(column.statistic.requiresChannel ? 1 : 0.45)
+                    Toggle("", isOn: $column.showValues)
+                        .toggleStyle(.checkbox)
+                        .frame(width: 52)
+
+                    Toggle("", isOn: $column.defineAsControl)
+                        .toggleStyle(.checkbox)
+                        .frame(width: 66)
 
                     Toggle("", isOn: $column.heatMapped)
                         .toggleStyle(.checkbox)
@@ -238,6 +296,86 @@ struct TableEditorView: View {
         .labelsHidden()
     }
 
+    @ViewBuilder
+    private func columnDefinition(column: Binding<WorkspaceTableColumn>) -> some View {
+        switch column.wrappedValue.columnType {
+        case .statistic:
+            HStack(spacing: 6) {
+                Picker("", selection: column.statistic) {
+                    ForEach(WorkspaceStatisticKind.allCases) { statistic in
+                        Text(statistic.rawValue).tag(statistic)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 152)
+
+                if column.wrappedValue.statistic.requiresChannel {
+                    parameterPicker(column: column)
+                        .frame(width: 170)
+                }
+
+                if column.wrappedValue.statistic.requiresPercentile {
+                    TextField(
+                        "P",
+                        value: Binding<Double>(
+                            get: { column.wrappedValue.percentile ?? 50 },
+                            set: { column.wrappedValue.percentile = $0 }
+                        ),
+                        format: .number
+                    )
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 54)
+                        .help("Percentile")
+                }
+
+                if column.wrappedValue.statistic == .frequencyOfPopulation {
+                    TextField(
+                        "Denominator path",
+                        text: Binding<String>(
+                            get: { column.wrappedValue.denominatorGatePath.joined(separator: "/") },
+                            set: { column.wrappedValue.denominatorGatePath = $0.split(separator: "/").map(String.init) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                }
+            }
+        case .keyword:
+            HStack(spacing: 6) {
+                Picker("", selection: column.keyword.scope) {
+                    ForEach(KeywordScope.allCases) { scope in
+                        Text(scope.rawValue).tag(scope)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 116)
+
+                TextField("Keyword", text: column.keyword.key)
+                    .textFieldStyle(.roundedBorder)
+
+                if column.wrappedValue.keyword.scope == .parameter {
+                    parameterNamePicker(column: column)
+                        .frame(width: 150)
+                }
+            }
+        case .formula:
+            TextField("Formula, e.g. <Cell column=\"Mean\"/> / <Cell column=\"Count\"/>", text: column.formula.expression)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func parameterNamePicker(column: Binding<WorkspaceTableColumn>) -> some View {
+        let names = workspace.availableStatisticChannelNames(for: column.wrappedValue.sourceSelection)
+        return Picker("", selection: Binding<String>(
+            get: { column.wrappedValue.keyword.parameterName ?? names.first ?? "" },
+            set: { column.wrappedValue.keyword.parameterName = $0.isEmpty ? nil : $0 }
+        )) {
+            ForEach(names, id: \.self) { name in
+                Text(name).tag(name)
+            }
+        }
+        .labelsHidden()
+    }
+
     private func addWorkspaceSelection() {
         guard let selection = workspace.selected else { return }
         let path = workspace.gatePathNames(for: selection)
@@ -247,11 +385,37 @@ struct TableEditorView: View {
                 sourceSelection: selection,
                 gatePath: path,
                 name: path.last ?? workspace.displayName(for: selection),
-                statistic: .count,
+                statistic: .frequencyOfParent,
                 channelName: workspace.availableStatisticChannelNames(for: selection).first
             )
         )
         status = "Added \(path.last ?? "population")."
+    }
+
+    private func addKeywordColumn() {
+        columns.append(
+            WorkspaceTableColumn(
+                columnType: .keyword,
+                sourceSelection: workspace.selected,
+                gatePath: [],
+                name: "Keyword",
+                keyword: KeywordColumnSpec(key: "$FIL")
+            )
+        )
+        status = "Added a keyword column."
+    }
+
+    private func addFormulaColumn() {
+        columns.append(
+            WorkspaceTableColumn(
+                columnType: .formula,
+                sourceSelection: workspace.selected,
+                gatePath: [],
+                name: "Formula",
+                formula: FormulaColumnSpec(expression: "")
+            )
+        )
+        status = "Added a formula column."
     }
 
     private func duplicateSelectedRows() {
@@ -357,9 +521,11 @@ private enum TableDisplayTarget: String, CaseIterable, Identifiable {
 }
 
 private enum TableFileFormat: String, CaseIterable, Identifiable {
-    case text = "Text"
+    case text = "TSV"
     case csv = "CSV"
     case html = "HTML"
+    case sql = "SQL"
+    case excelXML = "Excel XML"
 
     var id: String { rawValue }
 
@@ -368,6 +534,8 @@ private enum TableFileFormat: String, CaseIterable, Identifiable {
         case .text: return "txt"
         case .csv: return "csv"
         case .html: return "html"
+        case .sql: return "sql"
+        case .excelXML: return "xml"
         }
     }
 
@@ -379,6 +547,10 @@ private enum TableFileFormat: String, CaseIterable, Identifiable {
             return [UTType(filenameExtension: "csv") ?? .commaSeparatedText]
         case .html:
             return [.html]
+        case .sql:
+            return [UTType(filenameExtension: "sql") ?? .plainText]
+        case .excelXML:
+            return [.xml]
         }
     }
 
@@ -390,14 +562,19 @@ private enum TableFileFormat: String, CaseIterable, Identifiable {
             return delimited(output, separator: ",")
         case .html:
             return html(output)
+        case .sql:
+            return sql(output)
+        case .excelXML:
+            return excelXML(output)
         }
     }
 
     private func delimited(_ output: WorkspaceTableOutput, separator: String) -> String {
-        let header = ["Sample"] + output.columns.map(\.name)
+        let visible = visibleColumnIndices(output)
+        let header = ["Sample"] + visible.map { output.columns[$0].name }
         let lines = output.rows.map { row in
-            ([row.sampleName] + row.values.map { value in
-                value.map { formatStatistic($0) } ?? ""
+            ([row.sampleName] + visible.map { index in
+                row.values.indices.contains(index) ? row.values[index].displayString : ""
             })
             .map { escapeDelimited($0, separator: separator) }
             .joined(separator: separator)
@@ -408,11 +585,13 @@ private enum TableFileFormat: String, CaseIterable, Identifiable {
 
     private func html(_ output: WorkspaceTableOutput) -> String {
         let ranges = heatMapRanges(for: output)
-        let headerCells = output.columns.map { "<th>\(escapeHTML($0.name))</th>" }.joined()
+        let visible = visibleColumnIndices(output)
+        let headerCells = visible.map { "<th>\(escapeHTML(output.columns[$0].name))</th>" }.joined()
         let bodyRows = output.rows.map { row in
-            let valueCells = row.values.enumerated().map { index, value -> String in
-                let text = value.map { formatStatistic($0) } ?? ""
-                let style = heatMapStyle(value: value, range: ranges[index], enabled: output.columns[index].heatMapped)
+            let valueCells = visible.map { index -> String in
+                let value = row.values.indices.contains(index) ? row.values[index] : .missing
+                let text = value.displayString
+                let style = heatMapStyle(value: value.number, range: ranges[index], enabled: output.columns[index].heatMapped)
                 return "<td\(style)>\(escapeHTML(text))</td>"
             }.joined()
             return "<tr><th>\(escapeHTML(row.sampleName))</th>\(valueCells)</tr>"
@@ -442,6 +621,42 @@ private enum TableFileFormat: String, CaseIterable, Identifiable {
         </html>
         """
     }
+
+    private func sql(_ output: WorkspaceTableOutput) -> String {
+        let visible = visibleColumnIndices(output)
+        let columnNames = visible.map { sqlIdentifier(output.columns[$0].name) }
+        let definitions = (["sample_name TEXT"] + columnNames.map { "\($0) TEXT" }).joined(separator: ", ")
+        let inserts = output.rows.map { row in
+            let values = [row.sampleName] + visible.map { index in
+                row.values.indices.contains(index) ? row.values[index].displayString : ""
+            }
+            return "INSERT INTO openflo_table VALUES (\(values.map(sqlLiteral).joined(separator: ", ")));"
+        }
+        return (["CREATE TABLE openflo_table (\(definitions));"] + inserts).joined(separator: "\n")
+    }
+
+    private func excelXML(_ output: WorkspaceTableOutput) -> String {
+        let visible = visibleColumnIndices(output)
+        let headerCells = (["Sample"] + visible.map { output.columns[$0].name }).map(excelCell).joined()
+        let rows = output.rows.map { row in
+            let values = [row.sampleName] + visible.map { index in
+                row.values.indices.contains(index) ? row.values[index].displayString : ""
+            }
+            return "<Row>\(values.map(excelCell).joined())</Row>"
+        }.joined(separator: "\n")
+        return """
+        <?xml version="1.0"?>
+        <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+          xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+        <Worksheet ss:Name="OpenFlo Table">
+        <Table>
+        <Row>\(headerCells)</Row>
+        \(rows)
+        </Table>
+        </Worksheet>
+        </Workbook>
+        """
+    }
 }
 
 private struct TableOutputView: View {
@@ -449,23 +664,24 @@ private struct TableOutputView: View {
 
     var body: some View {
         let ranges = heatMapRanges(for: output)
+        let visible = visibleColumnIndices(output)
         ScrollView([.horizontal, .vertical]) {
             Grid(alignment: .trailing, horizontalSpacing: 0, verticalSpacing: 0) {
                 GridRow {
                     headerCell("Sample", alignment: .leading)
-                    ForEach(output.columns) { column in
-                        headerCell(column.name)
+                    ForEach(visible, id: \.self) { index in
+                        headerCell(output.columns[index].name)
                     }
                 }
 
                 ForEach(output.rows) { row in
                     GridRow {
                         bodyCell(row.sampleName, alignment: .leading)
-                        ForEach(output.columns.indices, id: \.self) { index in
-                            let value = row.values[index]
+                        ForEach(visible, id: \.self) { index in
+                            let value = row.values.indices.contains(index) ? row.values[index] : .missing
                             bodyCell(
-                                value.map { formatStatistic($0) } ?? "",
-                                fill: heatMapColor(value: value, range: ranges[index], enabled: output.columns[index].heatMapped)
+                                value.displayString,
+                                fill: heatMapColor(value: value.number, range: ranges[index], enabled: output.columns[index].heatMapped)
                             )
                         }
                     }
@@ -503,11 +719,15 @@ private enum TableOutputWindowStore {
 private func heatMapRanges(for output: WorkspaceTableOutput) -> [ClosedRange<Double>?] {
     output.columns.indices.map { index in
         let values = output.rows.compactMap { row in
-            row.values.indices.contains(index) ? row.values[index] : nil
+            row.values.indices.contains(index) ? row.values[index].number : nil
         }
         guard let minimum = values.min(), let maximum = values.max(), minimum < maximum else { return nil }
         return minimum...maximum
     }
+}
+
+private func visibleColumnIndices(_ output: WorkspaceTableOutput) -> [Int] {
+    output.columns.indices.filter { output.columns[$0].showValues }
 }
 
 private func heatMapColor(value: Double?, range: ClosedRange<Double>?, enabled: Bool) -> Color {
@@ -529,14 +749,7 @@ private func heatMapStyle(value: Double?, range: ClosedRange<Double>?, enabled: 
 }
 
 private func formatStatistic(_ value: Double) -> String {
-    guard value.isFinite else { return "" }
-    if abs(value.rounded() - value) < 0.0001 {
-        return Int(value.rounded()).formatted()
-    }
-    if abs(value) >= 100 {
-        return String(format: "%.1f", value)
-    }
-    return String(format: "%.3g", value)
+    formatReportNumber(value)
 }
 
 private func escapeDelimited(_ value: String, separator: String) -> String {
@@ -550,4 +763,25 @@ func escapeHTML(_ value: String) -> String {
         .replacingOccurrences(of: "<", with: "&lt;")
         .replacingOccurrences(of: ">", with: "&gt;")
         .replacingOccurrences(of: "\"", with: "&quot;")
+}
+
+private func sqlIdentifier(_ value: String) -> String {
+    let cleaned = value
+        .lowercased()
+        .map { character -> Character in
+            if character.isLetter || character.isNumber || character == "_" {
+                return character
+            }
+            return "_"
+        }
+    let identifier = String(cleaned).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+    return identifier.isEmpty ? "column" : identifier
+}
+
+private func sqlLiteral(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "''"))'"
+}
+
+private func excelCell(_ value: String) -> String {
+    "<Cell><Data ss:Type=\"String\">\(escapeHTML(value))</Data></Cell>"
 }

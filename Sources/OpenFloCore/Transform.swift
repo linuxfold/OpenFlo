@@ -112,4 +112,36 @@ public enum TransformKind: String, CaseIterable, Codable, Sendable, Identifiable
     public func legacyApply(to values: [Float], cofactor: Float = 150) -> [Float] {
         apply(to: values, cofactor: cofactor)
     }
+
+    public func inverse(
+        _ graphValue: Float,
+        cofactor: Float = 150,
+        extraNegativeDecades: Float = 0,
+        widthBasis: Float = 1,
+        positiveDecades: Float = 4.5
+    ) -> Float? {
+        guard graphValue.isFinite else { return nil }
+        switch self {
+        case .linear:
+            return graphValue
+        case .logarithmic:
+            return pow(10, graphValue)
+        case .arcsinh:
+            return sinh(graphValue) * max(cofactor, 1)
+        case .biexponential:
+            return Self.inverseSignedLogicle(graphValue, widthBasis: widthBasis * 0.85)
+        case .hyperlog:
+            return Self.inverseSignedLogicle(graphValue, widthBasis: widthBasis)
+        case .logicle, .pseudoLog:
+            return Self.inverseSignedLogicle(graphValue, widthBasis: widthBasis + extraNegativeDecades * 0.2)
+        case .miltenyi:
+            return Self.inverseSignedLogicle(graphValue, widthBasis: max(0.1, widthBasis * 0.65))
+        }
+    }
+
+    private static func inverseSignedLogicle(_ graphValue: Float, widthBasis: Float) -> Float {
+        let scale = max(pow(Float(10), widthBasis), 1)
+        let magnitude = (pow(Float(10), abs(graphValue)) - 1) * scale
+        return graphValue < 0 ? -magnitude : magnitude
+    }
 }

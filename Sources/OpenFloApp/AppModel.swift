@@ -65,6 +65,8 @@ enum PlotMode: String, CaseIterable, Codable, Identifiable, Sendable {
 
 @MainActor
 final class AppModel: ObservableObject {
+    nonisolated static let histogramBinCount = 256
+
     private static var childWindowControllers: [NSWindowController] = []
     private static var axisWindowControllers: [NSWindowController] = []
 
@@ -77,6 +79,7 @@ final class AppModel: ObservableObject {
     @Published var gateTool: GateTool = .cursor
     @Published var plotMode: PlotMode = .pseudocolor
     @Published var contourLevelPercent: Int = 5
+    @Published var histogramSmooth: Bool = true
     @Published private(set) var plotImage: NSImage?
     @Published private(set) var xRange: ClosedRange<Float> = 0...1
     @Published private(set) var yRange: ClosedRange<Float> = 0...1
@@ -104,7 +107,8 @@ final class AppModel: ObservableObject {
         yTransform: TransformKind = .linear,
         xAxisSettings: AxisDisplaySettings? = nil,
         yAxisSettings: AxisDisplaySettings? = nil,
-        plotMode: PlotMode? = nil
+        plotMode: PlotMode? = nil,
+        histogramSmooth: Bool = true
     ) {
         self.table = table
         self.baseMask = baseMask
@@ -112,6 +116,7 @@ final class AppModel: ObservableObject {
         self.xTransform = xTransform
         self.yTransform = yTransform
         self.plotMode = plotMode ?? Self.defaultPlotMode(for: table)
+        self.histogramSmooth = histogramSmooth
         if let xChannel, let yChannel {
             self.xChannel = xChannel
             self.yChannel = yChannel
@@ -353,6 +358,13 @@ final class AppModel: ObservableObject {
         recomputePlot(reason: "\(plotMode.rawValue) level \(clamped)%")
     }
 
+    func setHistogramSmooth(_ isSmooth: Bool) {
+        guard histogramSmooth != isSmooth else { return }
+        histogramSmooth = isSmooth
+        guard plotMode == .histogram else { return }
+        recomputePlot(reason: isSmooth ? "Histogram smoothing enabled" : "Histogram smoothing disabled")
+    }
+
     func transformsChanged() {
         clearGate(recompute: false)
         recomputePlot(reason: "Transform updated")
@@ -371,6 +383,7 @@ final class AppModel: ObservableObject {
         let ySettings = axisSettings(forChannel: yChannel)
         let plotMode = self.plotMode
         let contourLevelPercent = self.contourLevelPercent
+        let histogramSmooth = self.histogramSmooth
         let baseMask: EventMask?
         let repairedPopulationMask: Bool
         if let currentBaseMask = self.baseMask, currentBaseMask.count != table.rowCount {
@@ -389,13 +402,13 @@ final class AppModel: ObservableObject {
             let resolvedYRange: ClosedRange<Float>
             let image: NSImage
             if plotMode.isOneDimensional {
-                let histogram = Histogram1D.build(values: xValues, mask: baseMask, width: 640, xRange: resolvedXRange)
+                let histogram = Histogram1D.build(values: xValues, mask: baseMask, width: Self.histogramBinCount, xRange: resolvedXRange)
                 if plotMode == .cdf {
                     resolvedYRange = 0...1
                     image = CDFRenderer.image(from: histogram, yRange: resolvedYRange)
                 } else {
-                    resolvedYRange = Self.histogramYRange(maxBin: histogram.maxBin)
-                    image = HistogramRenderer.image(from: histogram, yRange: resolvedYRange)
+                    resolvedYRange = Self.histogramPreviewRange(displayMaximum: HistogramRenderer.displayMaximum(for: histogram, smooth: histogramSmooth))
+                    image = HistogramRenderer.image(from: histogram, width: 640, yRange: resolvedYRange, smooth: histogramSmooth)
                 }
             } else {
                 resolvedYRange = ySettings.resolvedRange(auto: EventTable.range(values: yValues, mask: baseMask))
@@ -560,7 +573,8 @@ final class AppModel: ObservableObject {
             xTransform: xTransform,
             yTransform: yTransform,
             xAxisSettings: axisSettings(for: .x),
-            yAxisSettings: axisSettings(for: .y)
+            yAxisSettings: axisSettings(for: .y),
+            histogramSmooth: histogramSmooth
         )
 
         let window = NSWindow(
@@ -680,7 +694,11 @@ final class AppModel: ObservableObject {
     }
 
     nonisolated static func histogramPreviewRange(maxBin: UInt32) -> ClosedRange<Float> {
-        histogramYRange(maxBin: maxBin)
+        histogramYRange(maximum: Float(maxBin))
+    }
+
+    nonisolated static func histogramPreviewRange(displayMaximum: Float) -> ClosedRange<Float> {
+        histogramYRange(maximum: displayMaximum)
     }
 
     private static func firstIndex(in names: [String], exactly target: String, excluding excluded: Int? = nil) -> Int? {
@@ -715,8 +733,8 @@ final class AppModel: ObservableObject {
         name.uppercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    private nonisolated static func histogramYRange(maxBin: UInt32) -> ClosedRange<Float> {
-        let maximum = max(Float(maxBin), 1)
+    private nonisolated static func histogramYRange(maximum: Float) -> ClosedRange<Float> {
+        let maximum = max(maximum, 1)
         let exponent = floor(log10(maximum))
         let magnitude = pow(Float(10), exponent)
         let fraction = maximum / magnitude

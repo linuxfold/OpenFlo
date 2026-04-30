@@ -7,6 +7,12 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
     }
 }
 
+func expectClose(_ actual: Double?, _ expected: Double, tolerance: Double = 0.0001, _ message: String) {
+    guard let actual, abs(actual - expected) <= tolerance else {
+        fatalError("\(message). Expected \(expected), got \(String(describing: actual))")
+    }
+}
+
 func testMaskBooleanOperations() {
     var left = EventMask(count: 130)
     var right = EventMask(count: 130)
@@ -68,6 +74,95 @@ func testRangesTolerateInvalidMasks() {
     expect(EventTable.range(values: values, mask: emptySelection) == 0...1, "range should fall back when no events are selected")
     expect(EventTable.range(values: nonFiniteValues) == 0...1, "range should fall back when no finite values are available")
     expect(EventTable.focusedRange(values: values, mask: shortMask) == 0...1, "focused range should fall back for mismatched masks")
+}
+
+func testStatisticEngineExactStatistics() {
+    let table = EventTable(
+        channels: [Channel(name: "FL1-A")],
+        columns: [[1, 2, 3, 4, 5, .nan, .infinity]]
+    )
+    var population = EventMask(count: table.rowCount)
+    for index in 0..<table.rowCount {
+        population[index] = true
+    }
+    var parent = EventMask(count: table.rowCount)
+    for index in 0..<6 {
+        parent[index] = true
+    }
+    let grandparent = EventMask(count: table.rowCount, fill: true)
+    var denominator = EventMask(count: table.rowCount)
+    for index in 0..<4 {
+        denominator[index] = true
+    }
+
+    func evaluate(_ kind: StatisticKind, percentile: Double? = nil) -> Double? {
+        StatisticEngine.evaluate(
+            request: StatisticRequest(kind: kind, channelName: "FL1-A", percentile: percentile),
+            table: table,
+            population: population,
+            parent: parent,
+            grandparent: grandparent,
+            denominator: denominator,
+            totalCount: table.rowCount,
+            channelResolver: { $0 == "FL1-A" ? 0 : nil }
+        ).number
+    }
+
+    expectClose(evaluate(.count), 7, "count should include non-finite channel values")
+    expectClose(evaluate(.frequencyOfParent), Double(7) / Double(6) * 100, "frequency of parent should use parent mask")
+    expectClose(evaluate(.frequencyOfGrandparent), 100, "frequency of grandparent should use grandparent mask")
+    expectClose(evaluate(.frequencyOfPopulation), Double(7) / Double(4) * 100, "frequency of population should use denominator mask")
+    expectClose(evaluate(.frequencyOfTotal), 100, "frequency of total should use table row count")
+    expectClose(evaluate(.mean), 3, "mean should ignore non-finite channel values")
+    expectClose(evaluate(.median), 3, "median should interpolate the central value")
+    expectClose(evaluate(.percentile, percentile: 25), 2, "percentile should use exact interpolation")
+    expectClose(evaluate(.standardDeviation), sqrt(2), "SD should use population standard deviation")
+    expectClose(evaluate(.cv), 100 * sqrt(2) / 3, "CV should be percent SD over mean")
+    expectClose(evaluate(.robustSD), 1.3652, "robust SD should use P84.13 and P15.87")
+    expectClose(evaluate(.robustCV), 45.5066667, tolerance: 0.0002, "robust CV should use documented FlowJo formula")
+    expectClose(evaluate(.mad), 1, "MAD should be median absolute deviation")
+    expectClose(evaluate(.madPercent), 100 / 3, "MADP should normalize MAD by median")
+    expectClose(evaluate(.geometricMean), 2.605171, tolerance: 0.0002, "geometric mean should use positive finite values")
+}
+
+func testStatisticEngineModeAndGraphSpace() {
+    let table = EventTable(channels: [Channel(name: "FL1-A")], columns: [[1, 2, 2, 3, 4]])
+    let population = EventMask(count: table.rowCount, fill: true)
+    let mode = StatisticEngine.evaluate(
+        request: StatisticRequest(kind: .mode, channelName: "FL1-A"),
+        table: table,
+        population: population,
+        parent: nil,
+        grandparent: nil,
+        totalCount: table.rowCount,
+        channelResolver: { $0 == "FL1-A" ? 0 : nil }
+    ).number
+    expectClose(mode, 2, "mode should return the most frequent selected value")
+
+    let graphMedian = StatisticEngine.evaluateChannelStatistic(
+        request: StatisticRequest(
+            kind: .median,
+            channelName: "FL1-A",
+            space: .exactGraph(StatisticTransformSettings(transform: .arcsinh, cofactor: 2))
+        ),
+        values: table.column(0),
+        mask: population
+    ).number
+    expectClose(graphMedian, asinh(Double(2) / Double(2)), "exact graph statistics should use transformed values")
+}
+
+func testTransformInverseRoundTrip() {
+    let values: [Float] = [-500, -10, 0, 10, 500]
+    for transform in TransformKind.allCases {
+        for value in values {
+            let graph = transform.apply(value, cofactor: 150, extraNegativeDecades: 1, widthBasis: 1.2, positiveDecades: 4.5)
+            guard let inverse = transform.inverse(graph, cofactor: 150, extraNegativeDecades: 1, widthBasis: 1.2, positiveDecades: 4.5) else {
+                fatalError("inverse should exist for \(transform.rawValue)")
+            }
+            let tolerance: Float = transform == .logarithmic && value < 1 ? 1.1 : 0.01
+            expect(abs(inverse - (transform == .logarithmic ? max(value, 1) : value)) <= tolerance, "inverse should round-trip \(transform.rawValue)")
+        }
+    }
 }
 
 func testFCSTextParserHandlesEscapedDelimiter() throws {
@@ -360,6 +455,9 @@ testRectangleGate()
 testHistogramBuildsExpectedBins()
 testFocusedRangeIgnoresExtremeOutliers()
 testRangesTolerateInvalidMasks()
+testStatisticEngineExactStatistics()
+testStatisticEngineModeAndGraphSpace()
+testTransformInverseRoundTrip()
 try testFCSTextParserHandlesEscapedDelimiter()
 try testFCSFloatByteOrders()
 try testFCSMarkerFluorochromeLabels()

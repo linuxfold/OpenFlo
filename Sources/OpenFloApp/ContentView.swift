@@ -303,8 +303,6 @@ struct ContentView: View {
                 handleGateDrop(providers, target: .allSamples)
             }
 
-            compensationGroupRow
-
             ForEach(workspace.groupRows) { row in
                 WorkspaceRowView(
                     row: row,
@@ -348,6 +346,8 @@ struct ContentView: View {
                     handleGateDrop(providers, target: row.selection)
                 }
             }
+
+            compensationGroupRow
         }
     }
 
@@ -871,7 +871,7 @@ private struct WorkspaceRowView: View {
                     CompensationBadgeView(badge: badge)
                         .onTapGesture(count: 2, perform: onCompensationDoubleClick)
                         .onDrag(compensationDragProvider)
-                } else if !row.isGate {
+                } else {
                     Color.clear
                         .frame(width: 16, height: 16)
                 }
