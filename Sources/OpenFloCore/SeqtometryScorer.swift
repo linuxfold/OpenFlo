@@ -4,6 +4,7 @@ public enum SeqtometryScoringError: Error, LocalizedError, Sendable {
     case noFeatureChannels
     case noVariableFeatureChannels
     case noSignatures
+    case matrixChannelMismatch
 
     public var errorDescription: String? {
         switch self {
@@ -13,6 +14,8 @@ public enum SeqtometryScoringError: Error, LocalizedError, Sendable {
             return "No variable single-cell feature channels are available for Seqtometry scoring."
         case .noSignatures:
             return "No Seqtometry signatures were provided."
+        case .matrixChannelMismatch:
+            return "The sparse single-cell matrix does not match its feature channels."
         }
     }
 }
@@ -29,6 +32,24 @@ public struct SeqtometryScoringProgress: Equatable, Sendable {
 }
 
 public enum SeqtometryScorer {
+    public static func tableByScoring(
+        matrixFile: SingleCellMatrixFile,
+        signatures: [SeqtometrySignature],
+        minMaxScale: Bool = true,
+        progress: ((SeqtometryScoringProgress) -> Void)? = nil
+    ) throws -> EventTable {
+        let scored = try scoreColumns(
+            matrixFile: matrixFile,
+            signatures: signatures,
+            minMaxScale: minMaxScale,
+            progress: progress
+        )
+        return EventTable(
+            channels: scored.map(\.channel),
+            columns: scored.map(\.values)
+        )
+    }
+
     public static func tableByAppendingScores(
         to table: EventTable,
         signatures: [SeqtometrySignature],
@@ -45,6 +66,118 @@ public enum SeqtometryScorer {
             channels: scored.map(\.channel),
             columns: scored.map(\.values)
         )
+    }
+
+    public static func scoreColumns(
+        matrixFile: SingleCellMatrixFile,
+        signatures: [SeqtometrySignature],
+        minMaxScale: Bool = true,
+        progress: ((SeqtometryScoringProgress) -> Void)? = nil
+    ) throws -> [(channel: Channel, values: [Float])] {
+        try scoreColumns(
+            matrix: matrixFile.matrix,
+            channels: matrixFile.channels,
+            signatures: signatures,
+            minMaxScale: minMaxScale,
+            progress: progress
+        )
+    }
+
+    public static func scoreColumns(
+        matrix: SingleCellSparseMatrix,
+        channels: [Channel],
+        signatures: [SeqtometrySignature],
+        minMaxScale: Bool = true,
+        progress: ((SeqtometryScoringProgress) -> Void)? = nil
+    ) throws -> [(channel: Channel, values: [Float])] {
+        guard !signatures.isEmpty else { throw SeqtometryScoringError.noSignatures }
+        guard matrix.geneCount == channels.count else { throw SeqtometryScoringError.matrixChannelMismatch }
+        guard !channels.isEmpty else { throw SeqtometryScoringError.noFeatureChannels }
+
+        let stats = meanAndStandardDeviation(matrix: matrix)
+        let activeGeneIndices = stats.indices.filter { stats[$0].standardDeviation > 0 }
+        guard !activeGeneIndices.isEmpty else { throw SeqtometryScoringError.noVariableFeatureChannels }
+
+        let means = activeGeneIndices.map { stats[$0].mean }
+        let standardDeviations = activeGeneIndices.map { stats[$0].standardDeviation }
+        let sourceIndices = Array(channels.indices)
+        let geneIndex = buildGeneIndex(
+            channels: channels,
+            sourceIndices: sourceIndices,
+            activeOrdinals: activeGeneIndices
+        )
+        let signatureGeneIndices = signatures.map { signature in
+            matchedGeneIndices(for: signature, in: geneIndex)
+        }
+
+        var activeIndexByGene = Array(repeating: -1, count: matrix.geneCount)
+        for activeIndex in activeGeneIndices.indices {
+            activeIndexByGene[activeGeneIndices[activeIndex]] = activeIndex
+        }
+
+        var baselineZScores = Array(repeating: Float(0), count: activeGeneIndices.count)
+        for activeIndex in activeGeneIndices.indices {
+            baselineZScores[activeIndex] = zScore(
+                0,
+                mean: means[activeIndex],
+                standardDeviation: standardDeviations[activeIndex]
+            )
+        }
+
+        var zScores = baselineZScores
+        var touchedActiveIndices: [Int] = []
+        var scoreColumns = Array(
+            repeating: Array(repeating: Float(0), count: matrix.cellCount),
+            count: signatures.count
+        )
+
+        progress?(SeqtometryScoringProgress(completedCells: 0, totalCells: matrix.cellCount, signatureCount: signatures.count))
+        let progressStep = max(1, matrix.cellCount / 100)
+        for cellIndex in 0..<matrix.cellCount {
+            touchedActiveIndices.removeAll(keepingCapacity: true)
+            for entry in matrix.entriesForCell(cellIndex) {
+                guard entry.geneIndex >= 0, entry.geneIndex < activeIndexByGene.count else { continue }
+                let activeIndex = activeIndexByGene[entry.geneIndex]
+                guard activeIndex >= 0 else { continue }
+                zScores[activeIndex] = zScore(
+                    entry.value,
+                    mean: means[activeIndex],
+                    standardDeviation: standardDeviations[activeIndex]
+                )
+                touchedActiveIndices.append(activeIndex)
+            }
+
+            let ranks = centeredGeneRanks(zScores: zScores)
+            for signatureIndex in signatures.indices {
+                scoreColumns[signatureIndex][cellIndex] = weightedKuiperScore(
+                    geneRanks: ranks.ranks,
+                    signatureGeneIndices: signatureGeneIndices[signatureIndex],
+                    center: ranks.center,
+                    startIndex: ranks.startIndex
+                )
+            }
+
+            for activeIndex in touchedActiveIndices {
+                zScores[activeIndex] = baselineZScores[activeIndex]
+            }
+
+            let completedCells = cellIndex + 1
+            if completedCells == matrix.cellCount || completedCells.isMultiple(of: progressStep) {
+                progress?(
+                    SeqtometryScoringProgress(
+                        completedCells: completedCells,
+                        totalCells: matrix.cellCount,
+                        signatureCount: signatures.count
+                    )
+                )
+            }
+        }
+
+        if minMaxScale {
+            scoreColumns = scoreColumns.map(minMaxScaled)
+        }
+
+        return signatureScoreColumns(signatures: signatures, scoreColumns: scoreColumns)
     }
 
     public static func scoreColumns(
@@ -81,12 +214,12 @@ public enum SeqtometryScorer {
         progress?(SeqtometryScoringProgress(completedCells: 0, totalCells: table.rowCount, signatureCount: signatures.count))
         let progressStep = max(1, table.rowCount / 100)
         for cellIndex in 0..<table.rowCount {
-            let ranks = centeredGeneRanks(
+            let ranks = centeredGeneRanks(zScores: zScores(
                 activeColumns: activeColumns,
                 means: means,
                 standardDeviations: standardDeviations,
                 cellIndex: cellIndex
-            )
+            ))
             for signatureIndex in signatures.indices {
                 scoreColumns[signatureIndex][cellIndex] = weightedKuiperScore(
                     geneRanks: ranks.ranks,
@@ -111,19 +244,7 @@ public enum SeqtometryScorer {
             scoreColumns = scoreColumns.map(minMaxScaled)
         }
 
-        return signatures.indices.map { index in
-            (
-                channel: Channel(
-                    name: signatures[index].name,
-                    displayName: signatures[index].name,
-                    markerName: signatures[index].name,
-                    kind: .seqtometrySignature,
-                    preferredTransform: .linear,
-                    signatureGenes: signatures[index].genes
-                ),
-                values: scoreColumns[index]
-            )
-        }
+        return signatureScoreColumns(signatures: signatures, scoreColumns: scoreColumns)
     }
 
     private static func meanAndStandardDeviation(_ values: [Float]) -> (mean: Float, standardDeviation: Float) {
@@ -139,15 +260,47 @@ public enum SeqtometryScorer {
         return (mean, sqrt(sumOfSquares / Float(finiteValues.count - 1)))
     }
 
+    private static func meanAndStandardDeviation(matrix: SingleCellSparseMatrix) -> [(mean: Float, standardDeviation: Float)] {
+        guard matrix.cellCount > 0 else {
+            return Array(repeating: (mean: Float(0), standardDeviation: Float(0)), count: matrix.geneCount)
+        }
+
+        var sums = Array(repeating: Float(0), count: matrix.geneCount)
+        var sumOfSquares = Array(repeating: Float(0), count: matrix.geneCount)
+        for cellIndex in 0..<matrix.cellCount {
+            for entry in matrix.entriesForCell(cellIndex) where entry.value.isFinite {
+                guard entry.geneIndex >= 0, entry.geneIndex < matrix.geneCount else { continue }
+                sums[entry.geneIndex] += entry.value
+                sumOfSquares[entry.geneIndex] += entry.value * entry.value
+            }
+        }
+
+        let count = Float(matrix.cellCount)
+        return sums.indices.map { geneIndex in
+            let mean = sums[geneIndex] / count
+            guard matrix.cellCount > 1 else { return (mean, Float(0)) }
+            let centeredSumOfSquares = max(Float(0), sumOfSquares[geneIndex] - count * mean * mean)
+            return (mean, sqrt(centeredSumOfSquares / Float(matrix.cellCount - 1)))
+        }
+    }
+
     private static func buildGeneIndex(
         table: EventTable,
+        sourceIndices: [Int],
+        activeOrdinals: [Int]
+    ) -> [String: [Int]] {
+        buildGeneIndex(channels: table.channels, sourceIndices: sourceIndices, activeOrdinals: activeOrdinals)
+    }
+
+    private static func buildGeneIndex(
+        channels: [Channel],
         sourceIndices: [Int],
         activeOrdinals: [Int]
     ) -> [String: [Int]] {
         var output: [String: [Int]] = [:]
         for activeIndex in activeOrdinals.indices {
             let sourceIndex = sourceIndices[activeOrdinals[activeIndex]]
-            let channel = table.channels[sourceIndex]
+            let channel = channels[sourceIndex]
             for name in [channel.name, channel.displayName, channel.markerName].compactMap({ $0 }) {
                 let key = normalizedGeneName(name)
                 guard !key.isEmpty else { continue }
@@ -174,16 +327,24 @@ public enum SeqtometryScorer {
         return output
     }
 
-    private static func centeredGeneRanks(
+    private static func zScores(
         activeColumns: [[Float]],
         means: [Float],
         standardDeviations: [Float],
         cellIndex: Int
+    ) -> [Float] {
+        activeColumns.indices.map { index in
+            zScore(activeColumns[index][cellIndex], mean: means[index], standardDeviation: standardDeviations[index])
+        }
+    }
+
+    private static func centeredGeneRanks(
+        zScores: [Float]
     ) -> (ranks: [Int], center: Int, startIndex: Int) {
-        let geneCount = activeColumns.count
-        let sortedOrdinals = activeColumns.indices.sorted { left, right in
-            let leftZ = zScore(activeColumns[left][cellIndex], mean: means[left], standardDeviation: standardDeviations[left])
-            let rightZ = zScore(activeColumns[right][cellIndex], mean: means[right], standardDeviation: standardDeviations[right])
+        let geneCount = zScores.count
+        let sortedOrdinals = zScores.indices.sorted { left, right in
+            let leftZ = zScores[left]
+            let rightZ = zScores[right]
             if leftZ == rightZ {
                 return left < right
             }
@@ -266,6 +427,25 @@ public enum SeqtometryScorer {
         return values.map { value in
             guard value.isFinite else { return 0 }
             return (value - minimum) / span
+        }
+    }
+
+    private static func signatureScoreColumns(
+        signatures: [SeqtometrySignature],
+        scoreColumns: [[Float]]
+    ) -> [(channel: Channel, values: [Float])] {
+        signatures.indices.map { index in
+            (
+                channel: Channel(
+                    name: signatures[index].name,
+                    displayName: signatures[index].name,
+                    markerName: signatures[index].name,
+                    kind: .seqtometrySignature,
+                    preferredTransform: .linear,
+                    signatureGenes: signatures[index].genes
+                ),
+                values: scoreColumns[index]
+            )
         }
     }
 

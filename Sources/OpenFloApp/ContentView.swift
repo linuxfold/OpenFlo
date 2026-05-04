@@ -686,14 +686,13 @@ private struct WorkspaceProgressBanner: View {
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 8) {
-                    Text(progress.title)
-                        .font(.callout.weight(.semibold))
-                    Text(progress.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(progress.title)
+                    .font(.callout.weight(.semibold))
+                Text(progress.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 if let fraction = progress.fraction {
                     ProgressView(value: fraction, total: 1)
@@ -714,7 +713,7 @@ private struct WorkspaceProgressBanner: View {
             }
         }
         .padding(.horizontal, 14)
-        .frame(height: 58)
+        .frame(minHeight: 72)
         .background(Color.teal.opacity(0.08))
         .overlay(alignment: .bottom) {
             Rectangle()

@@ -342,6 +342,20 @@ func testSingleCellDelimitedParserGenesByCells() throws {
     expect(file.table.value(event: 1, channel: 0) == 2, "gene x cell values should parse")
 }
 
+func testMatrixMarketSparseParserMaterializesExpectedValues() throws {
+    let directory = try matrixMarketFixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let matrixFile = try SingleCellDataParser.loadMatrixMarketMatrix(url: directory, normalizeCounts: false)
+    expect(matrixFile.matrix.geneCount == 2, "sparse Matrix Market parser should read gene count")
+    expect(matrixFile.matrix.cellCount == 3, "sparse Matrix Market parser should read cell count")
+    expect(matrixFile.matrix.nonZeroCount == 4, "sparse Matrix Market parser should keep only non-zero entries")
+
+    let table = matrixFile.materializedTable()
+    expect(table.column(0) == [1, 2, 0], "materialized first gene column should match Matrix Market entries")
+    expect(table.column(1) == [3, 0, 4], "materialized second gene column should match Matrix Market entries")
+}
+
 func testSeqtometrySignatureParser() throws {
     let text = """
     name\tvalue
@@ -353,6 +367,33 @@ func testSeqtometrySignatureParser() throws {
     expect(signatures.count == 2, "signature parser should read name/value rows")
     expect(signatures[0].genes == ["CD3D", "TRAC", "CD3G"], "comma-separated signature genes should parse")
     expect(signatures[1].genes == ["MS4A1", "CD79A"], "whitespace-separated signature genes should parse")
+}
+
+func testSparseSeqtometryScoreMatchesDenseMatrix() throws {
+    let directory = try matrixMarketFixtureDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let matrixURL = directory.appendingPathComponent("matrix.mtx")
+    let matrixFile = try SingleCellDataParser.loadMatrixMarketMatrix(url: directory, normalizeCounts: false)
+    let denseFile = try SingleCellDataParser.parseMatrixMarket(url: matrixURL, normalizeCounts: false)
+    let signatures = [
+        SeqtometrySignature(name: "CD3D score", genes: ["CD3D"]),
+        SeqtometrySignature(name: "MS4A1 score", genes: ["MS4A1"])
+    ]
+
+    let denseScores = try SeqtometryScorer.scoreColumns(table: denseFile.table, signatures: signatures)
+    let sparseScores = try SeqtometryScorer.scoreColumns(matrixFile: matrixFile, signatures: signatures)
+
+    expect(denseScores.count == sparseScores.count, "sparse scorer should emit the same number of score columns")
+    for scoreIndex in denseScores.indices {
+        expect(denseScores[scoreIndex].values.count == sparseScores[scoreIndex].values.count, "sparse score length should match dense score length")
+        for cellIndex in denseScores[scoreIndex].values.indices {
+            expect(
+                abs(denseScores[scoreIndex].values[cellIndex] - sparseScores[scoreIndex].values[cellIndex]) < 0.0001,
+                "sparse score should match dense score for signature \(scoreIndex), cell \(cellIndex)"
+            )
+        }
+    }
 }
 
 func testSeqtometryScoreMatchesReferenceExample() throws {
@@ -381,6 +422,36 @@ func testSeqtometryScoreMatchesReferenceExample() throws {
     expect(abs(scores[1] - 1) < 0.0001, "second reference score should match")
     expect(abs(scores[2] - 0.5) < 0.0001, "third reference score should match")
     expect(scored.channels[scoreIndex].kind == .seqtometrySignature, "score channels should be marked as signatures")
+}
+
+func matrixMarketFixtureDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("OpenFloMatrixMarket-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+    let matrix = """
+    %%MatrixMarket matrix coordinate real general
+    %
+    2 3 4
+    1 1 1
+    2 1 3
+    1 2 2
+    2 3 4
+    """
+    let features = """
+    ENSG0001\tCD3D
+    ENSG0002\tMS4A1
+    """
+    let barcodes = """
+    Cell1
+    Cell2
+    Cell3
+    """
+
+    try matrix.write(to: directory.appendingPathComponent("matrix.mtx"), atomically: true, encoding: .utf8)
+    try features.write(to: directory.appendingPathComponent("features.tsv"), atomically: true, encoding: .utf8)
+    try barcodes.write(to: directory.appendingPathComponent("barcodes.tsv"), atomically: true, encoding: .utf8)
+    return directory
 }
 
 func singleFloatFCS(
@@ -470,6 +541,8 @@ try testCompensationTwoChannelSpill()
 try testCompensationLeavesUnlistedChannelsUnchanged()
 try testCompensationMissingChannelThrows()
 try testSingleCellDelimitedParserGenesByCells()
+try testMatrixMarketSparseParserMaterializesExpectedValues()
 try testSeqtometrySignatureParser()
+try testSparseSeqtometryScoreMatchesDenseMatrix()
 try testSeqtometryScoreMatchesReferenceExample()
 print("OpenFloCore smoke tests passed")

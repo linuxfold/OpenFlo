@@ -6,6 +6,7 @@ public enum SingleCellDataError: Error, LocalizedError, Sendable {
     case missingMatrixMarketCompanion(String)
     case malformedMatrixMarket
     case emptyMatrix
+    case denseMatrixTooLarge(geneCount: Int, cellCount: Int, estimatedBytes: Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -19,6 +20,9 @@ public enum SingleCellDataError: Error, LocalizedError, Sendable {
             return "The Matrix Market file is malformed."
         case .emptyMatrix:
             return "The single-cell matrix is empty."
+        case .denseMatrixTooLarge(let geneCount, let cellCount, let estimatedBytes):
+            let bytes = ByteCountFormatter.string(fromByteCount: estimatedBytes, countStyle: .memory)
+            return "The Matrix Market dataset is \(geneCount) genes x \(cellCount) cells (~\(bytes) as dense Float values). Load it with Seqtometry signatures so OpenFlo can score it from sparse data, or use a smaller matrix."
         }
     }
 }
@@ -36,6 +40,8 @@ public struct SingleCellFile: Sendable {
 }
 
 public enum SingleCellDataParser {
+    public static let maximumDenseMatrixValues: Int64 = 120_000_000
+
     public static func load(url: URL) throws -> SingleCellFile {
         if try isDirectory(url) {
             guard let matrixURL = matrixMarketURL(in: url) else {
@@ -52,6 +58,34 @@ public enum SingleCellDataParser {
         default:
             throw SingleCellDataError.unsupportedFileType(url.pathExtension)
         }
+    }
+
+    public static func isMatrixMarketDataset(url: URL) -> Bool {
+        if url.pathExtension.lowercased() == "mtx" {
+            return true
+        }
+        guard (try? isDirectory(url)) == true else {
+            return false
+        }
+        return matrixMarketURL(in: url) != nil
+    }
+
+    public static func canMaterializeDense(_ matrix: SingleCellSparseMatrix) -> Bool {
+        canMaterializeDense(geneCount: matrix.geneCount, cellCount: matrix.cellCount)
+    }
+
+    public static func canMaterializeDense(geneCount: Int, cellCount: Int) -> Bool {
+        denseValueCount(geneCount: geneCount, cellCount: cellCount) <= maximumDenseMatrixValues
+    }
+
+    public static func matrixMarketDimensions(url: URL) throws -> (geneCount: Int, cellCount: Int, estimatedDenseByteCount: Int64) {
+        let matrixURL = try matrixMarketFileURL(from: url)
+        let dimensions = try readMatrixMarketDimensions(url: matrixURL)
+        return (
+            geneCount: dimensions.geneCount,
+            cellCount: dimensions.cellCount,
+            estimatedDenseByteCount: estimatedDenseByteCount(geneCount: dimensions.geneCount, cellCount: dimensions.cellCount)
+        )
     }
 
     public static func parseDelimited(url: URL) throws -> SingleCellFile {
@@ -77,6 +111,102 @@ public enum SingleCellDataParser {
     }
 
     public static func parseMatrixMarket(url: URL, normalizeCounts: Bool = true) throws -> SingleCellFile {
+        let matrixURL = try matrixMarketFileURL(from: url)
+        let dimensions = try readMatrixMarketDimensions(url: matrixURL)
+        guard canMaterializeDense(geneCount: dimensions.geneCount, cellCount: dimensions.cellCount) else {
+            throw SingleCellDataError.denseMatrixTooLarge(
+                geneCount: dimensions.geneCount,
+                cellCount: dimensions.cellCount,
+                estimatedBytes: estimatedDenseByteCount(geneCount: dimensions.geneCount, cellCount: dimensions.cellCount)
+            )
+        }
+
+        return try parseMatrixMarketDense(url: matrixURL, normalizeCounts: normalizeCounts)
+    }
+
+    public static func loadMatrixMarketMatrix(url: URL, normalizeCounts: Bool = true) throws -> SingleCellMatrixFile {
+        let matrixURL = try matrixMarketFileURL(from: url)
+        return try parseMatrixMarketMatrix(url: matrixURL, normalizeCounts: normalizeCounts)
+    }
+
+    private static func parseMatrixMarketMatrix(url: URL, normalizeCounts: Bool) throws -> SingleCellMatrixFile {
+        let featureURL = try companionURL(nextTo: url, candidates: ["features.tsv", "genes.tsv"], missingName: "features.tsv or genes.tsv")
+        let barcodeURL = try companionURL(nextTo: url, candidates: ["barcodes.tsv"], missingName: "barcodes.tsv")
+        let features = try readFeatureNames(url: featureURL)
+        let barcodes = try readSingleColumn(url: barcodeURL)
+        guard !features.isEmpty, !barcodes.isEmpty else { throw SingleCellDataError.emptyMatrix }
+
+        var geneCount = 0
+        var cellCount = 0
+        var sawDimensions = false
+        var cells: [[SparseMatrixEntry]] = []
+        var cellTotals: [Float] = []
+
+        try TextLineReader(url: url).forEachLine { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("%") else { return }
+            if !sawDimensions {
+                let dimensionParts = line.split(whereSeparator: \.isWhitespace)
+                guard dimensionParts.count >= 3,
+                      let parsedGeneCount = Int(dimensionParts[0]),
+                      let parsedCellCount = Int(dimensionParts[1]),
+                      parsedGeneCount == features.count,
+                      parsedCellCount == barcodes.count else {
+                    throw SingleCellDataError.malformedMatrixMarket
+                }
+                geneCount = parsedGeneCount
+                cellCount = parsedCellCount
+                cells = Array(repeating: [], count: cellCount)
+                cellTotals = Array(repeating: Float(0), count: cellCount)
+                sawDimensions = true
+                return
+            }
+
+            let parts = line.split(whereSeparator: \.isWhitespace)
+            guard parts.count >= 3,
+                  let oneBasedGene = Int(parts[0]),
+                  let oneBasedCell = Int(parts[1]),
+                  let value = Float(parts[2]),
+                  value.isFinite,
+                  oneBasedGene >= 1,
+                  oneBasedGene <= geneCount,
+                  oneBasedCell >= 1,
+                  oneBasedCell <= cellCount else {
+                throw SingleCellDataError.malformedMatrixMarket
+            }
+            let geneIndex = oneBasedGene - 1
+            let cellIndex = oneBasedCell - 1
+            cells[cellIndex].append(SparseMatrixEntry(geneIndex: geneIndex, value: value))
+            cellTotals[cellIndex] += value
+        }
+
+        guard sawDimensions else { throw SingleCellDataError.malformedMatrixMarket }
+
+        if normalizeCounts {
+            for cellIndex in cells.indices {
+                let total = cellTotals[cellIndex]
+                guard total > 0 else { continue }
+                for entryIndex in cells[cellIndex].indices {
+                    let entry = cells[cellIndex][entryIndex]
+                    cells[cellIndex][entryIndex] = SparseMatrixEntry(
+                        geneIndex: entry.geneIndex,
+                        value: log1p(entry.value * 10_000 / total)
+                    )
+                }
+            }
+        }
+
+        let channels = makeChannels(featureNames: features)
+        return SingleCellMatrixFile(
+            matrix: SingleCellSparseMatrix(geneCount: geneCount, cellCount: cellCount, cells: cells),
+            channels: channels,
+            cellIDs: barcodes,
+            orientation: .genesByCells,
+            sourceDescription: normalizeCounts ? "10x Matrix Market LogCP10K" : "10x Matrix Market"
+        )
+    }
+
+    private static func parseMatrixMarketDense(url: URL, normalizeCounts: Bool) throws -> SingleCellFile {
         let featureURL = try companionURL(nextTo: url, candidates: ["features.tsv", "genes.tsv"], missingName: "features.tsv or genes.tsv")
         let barcodeURL = try companionURL(nextTo: url, candidates: ["barcodes.tsv"], missingName: "barcodes.tsv")
         let features = try readFeatureNames(url: featureURL)
@@ -107,6 +237,7 @@ public enum SingleCellDataParser {
                   let oneBasedGene = Int(parts[0]),
                   let oneBasedCell = Int(parts[1]),
                   let value = Float(parts[2]),
+                  value.isFinite,
                   oneBasedGene >= 1,
                   oneBasedGene <= geneCount,
                   oneBasedCell >= 1,
@@ -129,9 +260,8 @@ public enum SingleCellDataParser {
             }
         }
 
-        let channels = makeChannels(featureNames: features)
         return SingleCellFile(
-            table: EventTable(channels: channels, columns: columns),
+            table: EventTable(channels: makeChannels(featureNames: features), columns: columns),
             cellIDs: barcodes,
             orientation: .genesByCells,
             sourceDescription: normalizeCounts ? "10x Matrix Market LogCP10K" : "10x Matrix Market"
@@ -267,6 +397,41 @@ public enum SingleCellDataParser {
         throw SingleCellDataError.missingMatrixMarketCompanion(missingName)
     }
 
+    private static func matrixMarketFileURL(from url: URL) throws -> URL {
+        if try isDirectory(url) {
+            guard let nestedMatrixURL = matrixMarketURL(in: url) else {
+                throw SingleCellDataError.missingMatrixMarketCompanion("matrix.mtx")
+            }
+            return nestedMatrixURL
+        }
+        return url
+    }
+
+    private static func readMatrixMarketDimensions(url: URL) throws -> (geneCount: Int, cellCount: Int) {
+        guard let dimensionLine = try TextLineReader(url: url).firstLine(where: { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !line.isEmpty && !line.hasPrefix("%")
+        }) else {
+            throw SingleCellDataError.malformedMatrixMarket
+        }
+
+        let dimensionParts = dimensionLine.split(whereSeparator: \.isWhitespace)
+        guard dimensionParts.count >= 3,
+              let geneCount = Int(dimensionParts[0]),
+              let cellCount = Int(dimensionParts[1]) else {
+            throw SingleCellDataError.malformedMatrixMarket
+        }
+        return (geneCount, cellCount)
+    }
+
+    private static func denseValueCount(geneCount: Int, cellCount: Int) -> Int64 {
+        Int64(geneCount) * Int64(cellCount)
+    }
+
+    private static func estimatedDenseByteCount(geneCount: Int, cellCount: Int) -> Int64 {
+        denseValueCount(geneCount: geneCount, cellCount: cellCount) * Int64(MemoryLayout<Float>.stride)
+    }
+
     private static func isDirectory(_ url: URL) throws -> Bool {
         let values = try url.resourceValues(forKeys: [.isDirectoryKey])
         return values.isDirectory == true
@@ -291,4 +456,62 @@ public enum SingleCellDataParser {
         }
         return nil
     }
+}
+
+private struct TextLineReader {
+    let url: URL
+    var chunkSize = 1_048_576
+
+    func firstLine(where predicate: (String) throws -> Bool) throws -> String? {
+        var output: String?
+        do {
+            try forEachLine { line in
+                if try predicate(line) {
+                    output = line
+                    throw TextLineReaderStop.stop
+                }
+            }
+        } catch TextLineReaderStop.stop {
+            return output
+        }
+        return output
+    }
+
+    func forEachLine(_ body: (String) throws -> Void) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var pending = Data()
+        while true {
+            guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                break
+            }
+            pending.append(chunk)
+
+            var searchStart = pending.startIndex
+            while let newlineIndex = pending[searchStart...].firstIndex(of: 10) {
+                var lineData = pending[searchStart..<newlineIndex]
+                if lineData.last == 13 {
+                    lineData = lineData.dropLast()
+                }
+                try body(String(decoding: lineData, as: UTF8.self))
+                searchStart = pending.index(after: newlineIndex)
+            }
+            if searchStart > pending.startIndex {
+                pending.removeSubrange(pending.startIndex..<searchStart)
+            }
+        }
+
+        if !pending.isEmpty {
+            var lineData = pending[pending.startIndex..<pending.endIndex]
+            if lineData.last == 13 {
+                lineData = lineData.dropLast()
+            }
+            try body(String(decoding: lineData, as: UTF8.self))
+        }
+    }
+}
+
+private enum TextLineReaderStop: Error {
+    case stop
 }

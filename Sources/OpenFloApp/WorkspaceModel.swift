@@ -385,32 +385,154 @@ final class WorkspaceModel: ObservableObject {
             )
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let file = try SingleCellDataParser.load(url: url)
-                    Task { @MainActor in
-                        self.updateProgress(
-                            progressID,
-                            title: "Loading Single-Cell Sample",
-                            detail: "Parsed \(file.table.rowCount.formatted()) cells and \(file.table.channelCount.formatted()) genes",
-                            fraction: signatures.isEmpty ? 0.75 : 0.25
+                    let table: EventTable
+                    var scoreOnlySparseMatrix = false
+
+                    if SingleCellDataParser.isMatrixMarketDataset(url: url) {
+                        Task { @MainActor in
+                            self.updateProgress(
+                                progressID,
+                                title: "Loading Single-Cell Sample",
+                                detail: "Inspecting Matrix Market header for \(url.lastPathComponent) to choose the safest loading strategy.",
+                                fraction: 0.04
+                            )
+                        }
+
+                        let dimensions = try SingleCellDataParser.matrixMarketDimensions(url: url)
+                        let matrixSummary = Self.singleCellMatrixSummary(
+                            geneCount: dimensions.geneCount,
+                            cellCount: dimensions.cellCount,
+                            estimatedDenseByteCount: dimensions.estimatedDenseByteCount
                         )
-                    }
-                    let table = signatures.isEmpty
-                        ? file.table
-                        : try SeqtometryScorer.tableByAppendingScores(
-                            to: file.table,
-                            signatures: signatures,
-                            progress: { progress in
-                                Task { @MainActor in
-                                    self.updateScoringProgress(
-                                        progressID,
-                                        sampleName: url.lastPathComponent,
-                                        progress: progress,
-                                        lowerBound: 0.25,
-                                        upperBound: 0.96
-                                    )
-                                }
+                        let canMaterializeDense = SingleCellDataParser.canMaterializeDense(
+                            geneCount: dimensions.geneCount,
+                            cellCount: dimensions.cellCount
+                        )
+
+                        if !signatures.isEmpty, !canMaterializeDense {
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Loading Sparse Matrix",
+                                    detail: "\(matrixSummary). Reading non-zero Matrix Market entries and applying LogCP10K normalization without expanding zeros.",
+                                    fraction: 0.10
+                                )
                             }
-                        )
+
+                            let matrixFile = try SingleCellDataParser.loadMatrixMarketMatrix(url: url)
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Preparing Signature Scoring",
+                                    detail: "Sparse matrix ready: \(matrixFile.matrix.nonZeroCount.formatted()) non-zero values. Raw genes will stay sparse; only signature score channels will be materialized.",
+                                    fraction: 0.28
+                                )
+                            }
+
+                            table = try SeqtometryScorer.tableByScoring(
+                                matrixFile: matrixFile,
+                                signatures: signatures,
+                                progress: { progress in
+                                    Task { @MainActor in
+                                        self.updateScoringProgress(
+                                            progressID,
+                                            sampleName: url.lastPathComponent,
+                                            progress: progress,
+                                            lowerBound: 0.30,
+                                            upperBound: 0.96
+                                        )
+                                    }
+                                }
+                            )
+                            scoreOnlySparseMatrix = true
+                        } else {
+                            if !canMaterializeDense {
+                                throw SingleCellDataError.denseMatrixTooLarge(
+                                    geneCount: dimensions.geneCount,
+                                    cellCount: dimensions.cellCount,
+                                    estimatedBytes: dimensions.estimatedDenseByteCount
+                                )
+                            }
+
+                            let denseReason = signatures.isEmpty
+                                ? "No signatures were selected, so OpenFlo is building a dense gene table for plotting."
+                                : "This matrix is small enough for the fast dense path; OpenFlo is building the gene table before scoring."
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Loading Dense Matrix",
+                                    detail: "\(matrixSummary). \(denseReason)",
+                                    fraction: 0.10
+                                )
+                            }
+
+                            let file = try SingleCellDataParser.load(url: url)
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: signatures.isEmpty ? "Preparing Plot Channels" : "Preparing Signature Scoring",
+                                    detail: "Dense table ready: \(file.table.rowCount.formatted()) cells and \(file.table.channelCount.formatted()) gene channels. \(signatures.isEmpty ? "Use signatures later to add score channels." : "Normalization is complete; starting signature scoring.")",
+                                    fraction: signatures.isEmpty ? 0.75 : 0.25
+                                )
+                            }
+
+                            if signatures.isEmpty {
+                                table = file.table
+                            } else {
+                                table = try SeqtometryScorer.tableByAppendingScores(
+                                    to: file.table,
+                                    signatures: signatures,
+                                    progress: { progress in
+                                        Task { @MainActor in
+                                            self.updateScoringProgress(
+                                                progressID,
+                                                sampleName: url.lastPathComponent,
+                                                progress: progress,
+                                                lowerBound: 0.25,
+                                                upperBound: 0.96
+                                            )
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    } else {
+                        Task { @MainActor in
+                            self.updateProgress(
+                                progressID,
+                                title: "Loading Single-Cell Sample",
+                                detail: "Reading delimited text into a dense cell-by-gene table.",
+                                fraction: 0.08
+                            )
+                        }
+                        let file = try SingleCellDataParser.load(url: url)
+                        Task { @MainActor in
+                            self.updateProgress(
+                                progressID,
+                                title: "Loading Single-Cell Sample",
+                                detail: "Parsed \(file.table.rowCount.formatted()) cells and \(file.table.channelCount.formatted()) genes",
+                                fraction: signatures.isEmpty ? 0.75 : 0.25
+                            )
+                        }
+                        table = signatures.isEmpty
+                            ? file.table
+                            : try SeqtometryScorer.tableByAppendingScores(
+                                to: file.table,
+                                signatures: signatures,
+                                progress: { progress in
+                                    Task { @MainActor in
+                                        self.updateScoringProgress(
+                                            progressID,
+                                            sampleName: url.lastPathComponent,
+                                            progress: progress,
+                                            lowerBound: 0.25,
+                                            upperBound: 0.96
+                                        )
+                                    }
+                                }
+                            )
+                        scoreOnlySparseMatrix = false
+                    }
                     Task { @MainActor in
                         let sample = WorkspaceSample(name: url.lastPathComponent, url: url, kind: .singleCell, table: table)
                         self.samples.append(sample)
@@ -427,9 +549,12 @@ final class WorkspaceModel: ObservableObject {
                             )
                         } else {
                             let source = signatureSet.sourceName.map { " from \($0)" } ?? ""
+                            let sparseNote = scoreOnlySparseMatrix
+                                ? " Raw genes stayed sparse and were not added as plot channels."
+                                : ""
                             self.finishProgress(
                                 progressID,
-                                status: "Loaded \(url.lastPathComponent) with \(signatures.count) signature score channel(s)\(source)."
+                                status: "Loaded \(url.lastPathComponent) with \(signatures.count) signature score channel(s)\(source).\(sparseNote)"
                             )
                         }
                     }
@@ -508,22 +633,99 @@ final class WorkspaceModel: ObservableObject {
                 )
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
-                        let file = try SingleCellDataParser.load(url: matrixDirectory)
-                        let table = try SeqtometryScorer.tableByAppendingScores(
-                            to: file.table,
-                            signatures: signatures,
-                            progress: { progress in
-                                Task { @MainActor in
-                                    self.updateScoringProgress(
-                                        progressID,
-                                        sampleName: "PBMC3k demo",
-                                        progress: progress,
-                                        lowerBound: 0.25,
-                                        upperBound: 0.96
-                                    )
-                                }
-                            }
+                        Task { @MainActor in
+                            self.updateProgress(
+                                progressID,
+                                title: "Loading Demo Dataset",
+                                detail: "Inspecting PBMC3k Matrix Market header to choose dense or sparse loading.",
+                                fraction: 0.20
+                            )
+                        }
+
+                        let dimensions = try SingleCellDataParser.matrixMarketDimensions(url: matrixDirectory)
+                        let matrixSummary = Self.singleCellMatrixSummary(
+                            geneCount: dimensions.geneCount,
+                            cellCount: dimensions.cellCount,
+                            estimatedDenseByteCount: dimensions.estimatedDenseByteCount
                         )
+                        let table: EventTable
+                        let scoreOnlySparseMatrix: Bool
+                        if SingleCellDataParser.canMaterializeDense(
+                            geneCount: dimensions.geneCount,
+                            cellCount: dimensions.cellCount
+                        ) {
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Loading Dense Matrix",
+                                    detail: "\(matrixSummary). PBMC3k is small enough for the fast dense path; building gene channels before scoring.",
+                                    fraction: 0.24
+                                )
+                            }
+
+                            let file = try SingleCellDataParser.load(url: matrixDirectory)
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Preparing Signature Scoring",
+                                    detail: "Dense PBMC3k table ready: \(file.table.rowCount.formatted()) cells and \(file.table.channelCount.formatted()) gene channels. Starting signature scoring.",
+                                    fraction: 0.25
+                                )
+                            }
+
+                            table = try SeqtometryScorer.tableByAppendingScores(
+                                to: file.table,
+                                signatures: signatures,
+                                progress: { progress in
+                                    Task { @MainActor in
+                                        self.updateScoringProgress(
+                                            progressID,
+                                            sampleName: "PBMC3k demo",
+                                            progress: progress,
+                                            lowerBound: 0.25,
+                                            upperBound: 0.96
+                                        )
+                                    }
+                                }
+                            )
+                            scoreOnlySparseMatrix = false
+                        } else {
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Loading Sparse Matrix",
+                                    detail: "\(matrixSummary). Reading non-zero counts and keeping raw genes sparse while computing signatures.",
+                                    fraction: 0.24
+                                )
+                            }
+
+                            let matrixFile = try SingleCellDataParser.loadMatrixMarketMatrix(url: matrixDirectory)
+                            Task { @MainActor in
+                                self.updateProgress(
+                                    progressID,
+                                    title: "Preparing Signature Scoring",
+                                    detail: "Sparse PBMC3k matrix ready: \(matrixFile.matrix.nonZeroCount.formatted()) non-zero values. Only signature score channels will be materialized.",
+                                    fraction: 0.28
+                                )
+                            }
+
+                            table = try SeqtometryScorer.tableByScoring(
+                                matrixFile: matrixFile,
+                                signatures: signatures,
+                                progress: { progress in
+                                    Task { @MainActor in
+                                        self.updateScoringProgress(
+                                            progressID,
+                                            sampleName: "PBMC3k demo",
+                                            progress: progress,
+                                            lowerBound: 0.30,
+                                            upperBound: 0.96
+                                        )
+                                    }
+                                }
+                            )
+                            scoreOnlySparseMatrix = true
+                        }
                         Task { @MainActor in
                             let sample = WorkspaceSample(
                                 name: "PBMC3k Seqtometry Demo",
@@ -539,9 +741,12 @@ final class WorkspaceModel: ObservableObject {
                             if self.selected == nil {
                                 self.selected = WorkspaceSelection(sampleID: sample.id, gateID: nil)
                             }
+                            let sparseNote = scoreOnlySparseMatrix
+                                ? " Raw genes stayed sparse and were not added as plot channels."
+                                : ""
                             self.finishProgress(
                                 progressID,
-                                status: "Loaded PBMC3k demo with \(signatures.count) signature score channel(s)."
+                                status: "Loaded PBMC3k demo with \(signatures.count) signature score channel(s).\(sparseNote)"
                             )
                         }
                     } catch {
@@ -3434,6 +3639,15 @@ final class WorkspaceModel: ObservableObject {
             detail: "Scoring \(scoringProgress.signatureCount) signature(s) for \(sampleName): \(scoringProgress.completedCells.formatted()) / \(scoringProgress.totalCells.formatted()) cells (\(percent)%)",
             fraction: fraction
         )
+    }
+
+    private nonisolated static func singleCellMatrixSummary(
+        geneCount: Int,
+        cellCount: Int,
+        estimatedDenseByteCount: Int64
+    ) -> String {
+        let denseBytes = ByteCountFormatter.string(fromByteCount: estimatedDenseByteCount, countStyle: .memory)
+        return "\(cellCount.formatted()) cells x \(geneCount.formatted()) genes (~\(denseBytes) if dense)"
     }
 
     private func finishProgress(_ id: UUID, status: String) {
